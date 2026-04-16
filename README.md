@@ -28,7 +28,11 @@ curl -L https://github.com/Casper0301/ai-radio/releases/latest/download/AIRadio.
 
 The `xattr -cr` step removes the macOS quarantine flag (the app is ad-hoc signed, not notarized — this is fine for a free open-source app, but Gatekeeper would otherwise block it).
 
-After running this, look in the top-right of your menu bar for a `((•))` radio-waves icon.
+After running this, look in the top-right of your menu bar for a 🔒 lock icon — that's AI Radio waiting to be activated.
+
+## Activation (free, ~30 seconds)
+
+Streaming is gated behind a free email activation. Enter your email, get a 6-digit code in your inbox, paste it back — done. Your license key is stored locally and the lock icon turns into the radio-waves symbol. You won't be asked again on this Mac.
 
 ## Usage
 

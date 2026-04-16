@@ -239,8 +239,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            let img = NSImage(systemSymbolName: "dot.radiowaves.left.and.right",
-                              accessibilityDescription: "Music Radio")
+            let symbol = Activation.isActivated ? "dot.radiowaves.left.and.right" : "lock.fill"
+            let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "AI Radio")
             img?.isTemplate = true
             button.image = img
         }
@@ -262,6 +262,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         setupRemoteCommands()
         rebuildMenu(loading: true)
         Task { await loadStations() }
+
+        // Auto-prompt activation on launch if not activated yet
+        if !Activation.isActivated {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.showActivationFlow()
+            }
+        }
+    }
+
+    private func updateMenuBarIcon() {
+        guard let button = statusItem.button else { return }
+        let symbol = Activation.isActivated ? "dot.radiowaves.left.and.right" : "lock.fill"
+        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "AI Radio")
+        img?.isTemplate = true
+        button.image = img
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -332,6 +347,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     // MARK: - Playback
 
     private func play(station: Station) {
+        guard Activation.isActivated else {
+            showActivationFlow()
+            return
+        }
         if currentStation?.id == station.id, isPlaying { return }
 
         currentStation = station
@@ -386,6 +405,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
     private func rebuildMenu(loading: Bool = false, error: Error? = nil) {
         menu.removeAllItems()
+        let locked = !Activation.isActivated
+
+        if locked {
+            let title = NSMenuItem(title: "🔒  AI Radio is locked", action: nil, keyEquivalent: "")
+            title.isEnabled = false
+            menu.addItem(title)
+
+            let sub = NSMenuItem(title: "    Activate with your email to unlock streaming.",
+                                 action: nil, keyEquivalent: "")
+            sub.isEnabled = false
+            menu.addItem(sub)
+
+            menu.addItem(NSMenuItem.separator())
+
+            let activate = NSMenuItem(title: "✨ Activate AI Radio (free)",
+                                      action: #selector(showActivationFlow),
+                                      keyEquivalent: "")
+            activate.target = self
+            menu.addItem(activate)
+            menu.addItem(NSMenuItem.separator())
+        }
 
         // Header: current station + state
         if let cur = currentStation {
@@ -413,6 +453,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
                 keyEquivalent: " "
             )
             toggle.target = self
+            toggle.isEnabled = !locked
             menu.addItem(toggle)
         } else if loading && stations.isEmpty {
             let item = NSMenuItem(title: "Loading stations…", action: nil, keyEquivalent: "")
@@ -446,6 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
                     item.target = self
                     item.representedObject = s
                     if s.id == currentStation?.id { item.state = .on }
+                    item.isEnabled = !locked
                     submenu.addItem(item)
                 }
                 submenu.addItem(NSMenuItem.separator())
@@ -455,12 +497,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
                 submenu.removeItem(last)
             }
             stationsItem.submenu = submenu
+            stationsItem.isEnabled = !locked
             menu.addItem(stationsItem)
 
             let refresh = NSMenuItem(title: "Refresh Stations",
                                      action: #selector(refreshStationsAction),
                                      keyEquivalent: "")
             refresh.target = self
+            refresh.isEnabled = !locked
             menu.addItem(refresh)
         }
 
@@ -476,9 +520,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             mi.target = self
             mi.representedObject = f
             if abs(player.volume - f) < 0.05 { mi.state = .on }
+            mi.isEnabled = !locked
             volMenu.addItem(mi)
         }
         volItem.submenu = volMenu
+        volItem.isEnabled = !locked
         menu.addItem(volItem)
 
         // Open in browser (AzuraCast stations only — open the public player; Norwegian stations don't need it)
@@ -490,23 +536,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             menu.addItem(openItem)
         }
 
-        // Activation
-        menu.addItem(NSMenuItem.separator())
+        // Activation status (only shown when activated; locked-state UI is at the top)
         if Activation.isActivated {
+            menu.addItem(NSMenuItem.separator())
             let activated = NSMenuItem(
                 title: "✓ Activated\(Activation.email.map { " — \($0)" } ?? "")",
                 action: nil, keyEquivalent: ""
             )
             activated.isEnabled = false
             menu.addItem(activated)
-        } else {
-            let activate = NSMenuItem(
-                title: "✨ Activate AI Radio (free)",
-                action: #selector(showActivationFlow),
-                keyEquivalent: ""
-            )
-            activate.target = self
-            menu.addItem(activate)
         }
 
         // Quit
@@ -576,6 +614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
                 let key = try await Activation.claimLicense(email: email, code: code)
                 UserDefaults.standard.set(key, forKey: Activation.kLicenseKey)
                 UserDefaults.standard.set(email, forKey: Activation.kEmail)
+                self.updateMenuBarIcon()
                 self.rebuildMenu()
                 self.showSuccess(email: email, key: key)
             } catch {
@@ -678,7 +717,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     }
 
     private func cycleStation(direction: Int) {
-        guard !stations.isEmpty else { return }
+        guard Activation.isActivated, !stations.isEmpty else { return }
         let idx: Int
         if let cur = currentStation, let i = stations.firstIndex(where: { $0.id == cur.id }) {
             idx = (i + direction + stations.count) % stations.count
