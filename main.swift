@@ -134,10 +134,9 @@ enum Activation {
     static let anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndhdnBldWNvYW5wYm9xc3RodWpmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU5ODg3MTUsImV4cCI6MjA5MTU2NDcxNX0.Ald3JKaGxtdFRtNvm7RddzdBOc6kQO1UIT7rjsJlZZU"
     static let productSlug = "ai-radio"
 
-    static let kLicenseKey = "ai_radio_license_key"
     static let kEmail = "ai_radio_email"
 
-    static var isActivated: Bool { UserDefaults.standard.string(forKey: kLicenseKey) != nil }
+    static var isActivated: Bool { UserDefaults.standard.string(forKey: kEmail) != nil }
     static var email: String? { UserDefaults.standard.string(forKey: kEmail) }
 
     static func sendCode(email: String) async throws {
@@ -147,14 +146,16 @@ enum Activation {
         )
     }
 
-    static func claimLicense(email: String, code: String) async throws -> String {
+    /// Verifies the 6-digit code against the marketplace_codes table.
+    /// We discard the returned license_key — the code IS the activation.
+    static func verifyCode(email: String, code: String) async throws {
         struct Resp: Decodable { let license_key: String? ; let error: String? }
         let data = try await call(
             path: "claim-free-license",
             body: ["email": email, "code": code, "product_slug": productSlug]
         )
         let parsed = try JSONDecoder().decode(Resp.self, from: data)
-        if let key = parsed.license_key { return key }
+        if parsed.license_key != nil { return }
         throw ActivationError.server(parsed.error ?? "Activation failed")
     }
 
@@ -176,6 +177,28 @@ enum Activation {
             throw ActivationError.server("Server error \(http.statusCode)")
         }
         return data
+    }
+}
+
+// MARK: - Text field with proper Cmd+V/C/X/A in NSAlert accessory view
+
+/// NSTextField inside an NSAlert.accessoryView doesn't get standard editing
+/// shortcuts (Cmd+V etc.) propagated through the responder chain. This subclass
+/// catches them explicitly and forwards to the field editor.
+final class PastableTextField: NSTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let cmd = event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command
+        if cmd {
+            switch event.charactersIgnoringModifiers {
+            case "v": return NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: self)
+            case "c": return NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: self)
+            case "x": return NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: self)
+            case "a": return NSApp.sendAction(#selector(NSResponder.selectAll(_:)), to: nil, from: self)
+            case "z": return NSApp.sendAction(Selector(("undo:")), to: nil, from: self)
+            default: break
+            }
+        }
+        return super.performKeyEquivalent(with: event)
     }
 }
 
@@ -559,12 +582,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     @objc private func showActivationFlow() {
         let alert = NSAlert()
         alert.messageText = "Activate AI Radio"
-        alert.informativeText = "Enter your email to get a free license key. We'll send a 6-digit verification code to your inbox."
-        alert.addButton(withTitle: "Continue")
+        alert.informativeText = "Enter your email — we'll send a 6-digit code to your inbox to unlock streaming."
+        alert.addButton(withTitle: "Send code")
         alert.addButton(withTitle: "Cancel")
 
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        let field = PastableTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         field.placeholderString = "you@example.com"
+        field.isEditable = true
+        field.isSelectable = true
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
         if let prefilled = Activation.email { field.stringValue = prefilled }
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
@@ -591,32 +618,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     private func showCodeEntry(email: String) {
         let alert = NSAlert()
         alert.messageText = "Check your email"
-        alert.informativeText = "We sent a 6-digit code to \(email). It expires in 10 minutes."
+        alert.informativeText = "We sent a 6-digit code to \(email). Paste it below (Cmd+V works). It expires in 10 minutes."
         alert.addButton(withTitle: "Activate")
         alert.addButton(withTitle: "Cancel")
 
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 28))
+        let field = PastableTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 28))
         field.placeholderString = "123456"
+        field.isEditable = true
+        field.isSelectable = true
+        field.isBezeled = true
+        field.bezelStyle = .roundedBezel
         field.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
 
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard code.count == 6, Int(code) != nil else {
+        // Tolerate spaces and stray characters from copy-paste; pull just the digits
+        let raw = field.stringValue
+        let digits = raw.filter(\.isNumber)
+        guard digits.count == 6 else {
             showError(message: "The code should be 6 digits.")
             return
         }
 
         Task { @MainActor in
             do {
-                let key = try await Activation.claimLicense(email: email, code: code)
-                UserDefaults.standard.set(key, forKey: Activation.kLicenseKey)
+                try await Activation.verifyCode(email: email, code: digits)
                 UserDefaults.standard.set(email, forKey: Activation.kEmail)
                 self.updateMenuBarIcon()
                 self.rebuildMenu()
-                self.showSuccess(email: email, key: key)
+                self.showSuccess(email: email)
             } catch {
                 self.showError(message: error.localizedDescription)
             }
@@ -635,18 +667,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     }
 
     @MainActor
-    private func showSuccess(email: String, key: String) {
+    private func showSuccess(email: String) {
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "AI Radio activated"
-        alert.informativeText = "You're set, \(email). Your license key is below — keep it safe (we'll re-send it any time you activate again with the same email).\n\n\(key)"
-        alert.addButton(withTitle: "Copy key")
+        alert.informativeText = "You're set, \(email). Streaming is now unlocked — pick a station from the menu bar."
         alert.addButton(withTitle: "Done")
         NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(key, forType: .string)
-        }
+        alert.runModal()
     }
 
     private func formatNowPlaying(_ np: NowPlayingInfo) -> String {
