@@ -1,0 +1,14 @@
+# Build output
+AI Radio.app/
+MusicRadio.app/
+*.dSYM/
+*.zip
+
+# macOS
+.DS_Store
+._*
+
+# Editor
+.vscode/
+.idea/
+*.swp
