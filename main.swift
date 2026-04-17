@@ -29,8 +29,10 @@ struct NowPlayingInfo: Equatable {
 // MARK: - Genre map (AzuraCast shortcode → curated genre bucket)
 
 enum Genres {
-    /// Curator's grouping of musicradio.ai stations into 11 genre buckets.
+    /// Curator's grouping of musicradio.ai stations into genre buckets.
     static let aiMap: [String: String] = [
+        // Mixed — the master stream that pulls from everything
+        "musicradio.ai":              "Mixed",
         // Chill & Focus
         "music_radio_acoustic":       "Chill & Focus",
         "music_radio_ambient":        "Chill & Focus",
@@ -79,9 +81,11 @@ enum Genres {
     ]
 
     /// Display order for groups in the Stations submenu.
-    /// Norwegian first, then alphabetical genre buckets, with "Other" / "Discover" last.
+    /// Norwegian first, then the Mixed all-genres stream, then alphabetical
+    /// genre buckets, with "Other" / "Discover" last.
     static let order: [String] = [
         "Norwegian",
+        "Mixed",
         "Chill & Focus",
         "Classical",
         "Country",
@@ -101,7 +105,9 @@ enum Genres {
     }
 
     /// "Music Radio Jazz" → "Jazz". Leaves names without the prefix untouched.
-    static func displayName(from raw: String) -> String {
+    /// Special-cases the master "MusicRadio.AI" stream to "All Genres".
+    static func displayName(from raw: String, shortcode: String) -> String {
+        if shortcode == "musicradio.ai" { return "All Genres" }
         let prefix = "Music Radio "
         if raw.hasPrefix(prefix) { return String(raw.dropFirst(prefix.count)) }
         return raw
@@ -166,13 +172,10 @@ enum AzuraCast {
         let url = baseURL.appendingPathComponent("api/nowplaying")
         let (data, _) = try await URLSession.shared.data(from: url)
         let raw = try JSONDecoder().decode([StationsResponse].self, from: data)
-        return raw.compactMap { r -> Station? in
-            // Skip the "musicradio.ai" master/aggregate stream — it's the same content
-            // mixed across all stations and clutters the menu.
-            if r.station.shortcode == "musicradio.ai" { return nil }
+        return raw.map { r in
             let best = r.station.mounts.max(by: { $0.bitrate < $1.bitrate })
             let url = best?.url ?? r.station.listen_url
-            let display = Genres.displayName(from: r.station.name)
+            let display = Genres.displayName(from: r.station.name, shortcode: r.station.shortcode)
             return Station(
                 id: "azuracast:\(r.station.shortcode)",
                 name: r.station.name,
