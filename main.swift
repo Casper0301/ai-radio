@@ -4,11 +4,6 @@ import MediaPlayer
 
 // MARK: - Models
 
-enum StationGroup: String, CaseIterable, Hashable {
-    case aiMusic = "AI Music"
-    case norwegian = "Norwegian Radio"
-}
-
 enum NowPlayingSource: Hashable {
     case azuracast(shortcode: String, baseURL: URL)
     case icyStream
@@ -16,8 +11,9 @@ enum NowPlayingSource: Hashable {
 
 struct Station: Hashable {
     let id: String
-    let name: String
-    let group: StationGroup
+    let name: String          // raw name from source (used for now-playing fallback)
+    let displayName: String   // shown in the menu (e.g. "Music Radio Jazz" → "Jazz")
+    let genre: String         // group label, e.g. "Jazz & Blues", "Norwegian"
     let listenURL: URL
     let bitrate: Int
     let format: String
@@ -28,6 +24,110 @@ struct NowPlayingInfo: Equatable {
     let artist: String
     let title: String
     let artURL: URL?
+}
+
+// MARK: - Genre map (AzuraCast shortcode → curated genre bucket)
+
+enum Genres {
+    /// Curator's grouping of musicradio.ai stations into 11 genre buckets.
+    static let aiMap: [String: String] = [
+        // Chill & Focus
+        "music_radio_acoustic":       "Chill & Focus",
+        "music_radio_ambient":        "Chill & Focus",
+        "music_radio_chillout":       "Chill & Focus",
+        "music_radio_focus_study":    "Chill & Focus",
+        "music_radio_lo-fi":          "Chill & Focus",
+        "music_radio_lounge":         "Chill & Focus",
+        "music_radio_sleep":          "Chill & Focus",
+        "music_radio_zen":            "Chill & Focus",
+        "place_du_dauphine":          "Chill & Focus",
+        "family_office_hq":           "Chill & Focus",
+        // Electronic
+        "music_radio_chillout_deep_house": "Electronic",
+        "music_radio_dance":          "Electronic",
+        "music_radio_disco":          "Electronic",
+        "music_radio_drum__bass":     "Electronic",
+        "music_radio_synthwave":      "Electronic",
+        "music_radio_techno":         "Electronic",
+        "music_radio_uk_garage":      "Electronic",
+        // Hip-Hop & Soul
+        "music_radio_acid_jazz":      "Hip-Hop & Soul",
+        "music_radio_funk":           "Hip-Hop & Soul",
+        "music_radio_hip_hop":        "Hip-Hop & Soul",
+        "music_radio_rb__soul":       "Hip-Hop & Soul",
+        // Rock & Metal
+        "music_radio_grunge_rock":    "Rock & Metal",
+        "music_radio_indie_alternative": "Rock & Metal",
+        "music_radio_metal":          "Rock & Metal",
+        "music_radio_rock":           "Rock & Metal",
+        // Jazz & Blues
+        "music_radio_blues":          "Jazz & Blues",
+        "music_radio_jazz":           "Jazz & Blues",
+        // Singletons
+        "music_radio_classical":      "Classical",
+        "music_radio_pop":            "Pop",
+        "music_radio_country":        "Country",
+        "music_radio_fitness":        "Fitness",
+        "music_radio_gospel":         "Gospel",
+        // World
+        "music_radio_afrobeats":      "World",
+        "music_radio_celtic":         "World",
+        "music_radio_french_chanson": "World",
+        "music_radio_k-pop":          "World",
+        "music_radio_latin":          "World",
+        "music_radio_reggae":         "World",
+    ]
+
+    /// Display order for groups in the Stations submenu.
+    /// Norwegian first, then alphabetical genre buckets, with "Other" / "Discover" last.
+    static let order: [String] = [
+        "Norwegian",
+        "Chill & Focus",
+        "Classical",
+        "Country",
+        "Electronic",
+        "Fitness",
+        "Gospel",
+        "Hip-Hop & Soul",
+        "Jazz & Blues",
+        "Pop",
+        "Rock & Metal",
+        "World",
+        "Other",
+    ]
+
+    static func bucket(for shortcode: String) -> String {
+        aiMap[shortcode] ?? "Other"
+    }
+
+    /// "Music Radio Jazz" → "Jazz". Leaves names without the prefix untouched.
+    static func displayName(from raw: String) -> String {
+        let prefix = "Music Radio "
+        if raw.hasPrefix(prefix) { return String(raw.dropFirst(prefix.count)) }
+        return raw
+    }
+}
+
+// MARK: - Favorites
+
+@MainActor
+enum Favorites {
+    private static let key = "favorite_station_ids"
+
+    static var ids: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+    }
+
+    static func contains(_ id: String) -> Bool { ids.contains(id) }
+
+    static func toggle(_ id: String) -> Bool {
+        var s = ids
+        let nowPinned: Bool
+        if s.contains(id) { s.remove(id); nowPinned = false }
+        else { s.insert(id); nowPinned = true }
+        UserDefaults.standard.set(Array(s).sorted(), forKey: key)
+        return nowPinned
+    }
 }
 
 // MARK: - AzuraCast API
@@ -62,23 +162,28 @@ enum AzuraCast {
         }
     }
 
-    static func fetchStations(baseURL: URL, group: StationGroup) async throws -> [Station] {
+    static func fetchStations(baseURL: URL) async throws -> [Station] {
         let url = baseURL.appendingPathComponent("api/nowplaying")
         let (data, _) = try await URLSession.shared.data(from: url)
         let raw = try JSONDecoder().decode([StationsResponse].self, from: data)
-        return raw.map { r in
+        return raw.compactMap { r -> Station? in
+            // Skip the "musicradio.ai" master/aggregate stream — it's the same content
+            // mixed across all stations and clutters the menu.
+            if r.station.shortcode == "musicradio.ai" { return nil }
             let best = r.station.mounts.max(by: { $0.bitrate < $1.bitrate })
             let url = best?.url ?? r.station.listen_url
+            let display = Genres.displayName(from: r.station.name)
             return Station(
                 id: "azuracast:\(r.station.shortcode)",
                 name: r.station.name,
-                group: group,
+                displayName: display,
+                genre: Genres.bucket(for: r.station.shortcode),
                 listenURL: url,
                 bitrate: best?.bitrate ?? 0,
                 format: best?.format ?? "mp3",
                 nowPlayingSource: .azuracast(shortcode: r.station.shortcode, baseURL: baseURL)
             )
-        }.sorted { $0.name.lowercased() < $1.name.lowercased() }
+        }.sorted { $0.displayName.lowercased() < $1.displayName.lowercased() }
     }
 
     static func fetchNowPlaying(baseURL: URL, shortcode: String) async throws -> NowPlayingInfo {
@@ -106,7 +211,8 @@ enum NorwegianRadio {
         Station(
             id: id,
             name: name,
-            group: .norwegian,
+            displayName: name,
+            genre: "Norwegian",
             listenURL: URL(string: url)!,
             bitrate: bitrate,
             format: format,
@@ -313,7 +419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         // Norwegian stations are static; AzuraCast is fetched.
         var combined = NorwegianRadio.stations
         do {
-            let ai = try await AzuraCast.fetchStations(baseURL: AzuraCast.musicRadioBase, group: .aiMusic)
+            let ai = try await AzuraCast.fetchStations(baseURL: AzuraCast.musicRadioBase)
             combined.append(contentsOf: ai)
             self.stations = combined
             if let last = defaults.string(forKey: kLastStation),
@@ -453,7 +559,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         // Header: current station + state
         if let cur = currentStation {
             let stateIcon: String = isPlaying ? "♪" : "■"
-            let header = NSMenuItem(title: "\(stateIcon)  \(cur.name)", action: nil, keyEquivalent: "")
+            let header = NSMenuItem(title: "\(stateIcon)  \(cur.displayName)", action: nil, keyEquivalent: "")
             header.isEnabled = false
             menu.addItem(header)
 
@@ -488,30 +594,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             menu.addItem(item)
         }
 
-        // Stations submenu — grouped
+        // Stations submenu — grouped by genre, with Favorites pinned at top
         if !stations.isEmpty {
             menu.addItem(NSMenuItem.separator())
             let stationsItem = NSMenuItem(title: "Stations  (\(stations.count))", action: nil, keyEquivalent: "")
             let submenu = NSMenu()
+            submenu.autoenablesItems = false
 
-            for group in StationGroup.allCases {
-                let inGroup = stations.filter { $0.group == group }
-                guard !inGroup.isEmpty else { continue }
+            let favIds = Favorites.ids
+            let pinned = stations.filter { favIds.contains($0.id) }
+                                 .sorted { $0.displayName.lowercased() < $1.displayName.lowercased() }
 
-                let header = NSMenuItem(title: "— \(group.rawValue.uppercased())  (\(inGroup.count)) —",
+            // ★ Favorites section (only shown if any pinned)
+            if !pinned.isEmpty {
+                let header = NSMenuItem(title: "— ★ FAVORITES  (\(pinned.count)) —",
                                         action: nil, keyEquivalent: "")
                 header.isEnabled = false
                 submenu.addItem(header)
+                for s in pinned { submenu.addItem(makeStationItem(s, locked: locked, isFavorite: true)) }
+                submenu.addItem(NSMenuItem.separator())
+            }
 
-                for s in inGroup {
-                    let item = NSMenuItem(title: s.name,
-                                          action: #selector(stationSelected(_:)),
-                                          keyEquivalent: "")
-                    item.target = self
-                    item.representedObject = s
-                    if s.id == currentStation?.id { item.state = .on }
-                    item.isEnabled = !locked
-                    submenu.addItem(item)
+            // Genre sections in curated order
+            let byGenre = Dictionary(grouping: stations, by: { $0.genre })
+            for genre in Genres.order {
+                guard let inGenre = byGenre[genre], !inGenre.isEmpty else { continue }
+                // Norwegian keeps insertion order; everything else is alphabetical
+                let sorted = (genre == "Norwegian") ? inGenre : inGenre.sorted {
+                    $0.displayName.lowercased() < $1.displayName.lowercased()
+                }
+                let header = NSMenuItem(title: "— \(genre.uppercased())  (\(sorted.count)) —",
+                                        action: nil, keyEquivalent: "")
+                header.isEnabled = false
+                submenu.addItem(header)
+                for s in sorted {
+                    submenu.addItem(makeStationItem(s, locked: locked, isFavorite: favIds.contains(s.id)))
                 }
                 submenu.addItem(NSMenuItem.separator())
             }
@@ -519,9 +636,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             if let last = submenu.items.last, last.isSeparatorItem {
                 submenu.removeItem(last)
             }
+
+            // Footer hint
+            submenu.addItem(NSMenuItem.separator())
+            let hint = NSMenuItem(title: "⌥-click any station to pin/unpin",
+                                  action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            submenu.addItem(hint)
+
             stationsItem.submenu = submenu
             stationsItem.isEnabled = !locked
             menu.addItem(stationsItem)
+
+            // Pin / Unpin Current Station — discoverable alternative to ⌥-click
+            if let cur = currentStation {
+                let isPinned = favIds.contains(cur.id)
+                let pinItem = NSMenuItem(
+                    title: isPinned ? "★ Unpin \(cur.displayName)" : "☆ Pin \(cur.displayName)",
+                    action: #selector(toggleCurrentFavorite),
+                    keyEquivalent: ""
+                )
+                pinItem.target = self
+                pinItem.isEnabled = !locked
+                menu.addItem(pinItem)
+            }
 
             let refresh = NSMenuItem(title: "Refresh Stations",
                                      action: #selector(refreshStationsAction),
@@ -552,7 +690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
         // Open in browser (AzuraCast stations only — open the public player; Norwegian stations don't need it)
         if let cur = currentStation, case let .azuracast(shortcode, baseURL) = cur.nowPlayingSource {
-            let openItem = NSMenuItem(title: "Open \(cur.name) in Browser",
+            let openItem = NSMenuItem(title: "Open \(cur.displayName) in Browser",
                                       action: #selector(openInBrowser(_:)), keyEquivalent: "")
             openItem.target = self
             openItem.representedObject = baseURL.appendingPathComponent("public/\(shortcode)")
@@ -689,7 +827,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
     @objc private func stationSelected(_ sender: NSMenuItem) {
         guard let s = sender.representedObject as? Station else { return }
-        play(station: s)
+        let optionDown = NSApp.currentEvent?.modifierFlags
+            .contains(.option) ?? false
+        if optionDown {
+            // ⌥-click: toggle favorite without starting playback
+            _ = Favorites.toggle(s.id)
+            rebuildMenu()
+        } else {
+            play(station: s)
+        }
+    }
+
+    @objc private func toggleCurrentFavorite() {
+        guard let cur = currentStation else { return }
+        _ = Favorites.toggle(cur.id)
+        rebuildMenu()
+    }
+
+    /// Builds an NSMenuItem for a station with the right title, target, state,
+    /// and favorite-star prefix.
+    private func makeStationItem(_ s: Station, locked: Bool, isFavorite: Bool) -> NSMenuItem {
+        let prefix = isFavorite ? "★ " : "  "
+        let item = NSMenuItem(title: prefix + s.displayName,
+                              action: #selector(stationSelected(_:)),
+                              keyEquivalent: "")
+        item.target = self
+        item.representedObject = s
+        if s.id == currentStation?.id { item.state = .on }
+        item.isEnabled = !locked
+        return item
     }
 
     @objc private func togglePlayPauseAction() { togglePlayPause() }
@@ -764,8 +930,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         }
 
         let info: [String: Any] = [
-            MPMediaItemPropertyTitle: nowPlaying.map { formatNowPlaying($0) } ?? cur.name,
-            MPMediaItemPropertyArtist: cur.name,
+            MPMediaItemPropertyTitle: nowPlaying.map { formatNowPlaying($0) } ?? cur.displayName,
+            MPMediaItemPropertyArtist: cur.displayName,
             MPNowPlayingInfoPropertyIsLiveStream: true,
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
         ]
