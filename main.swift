@@ -308,6 +308,166 @@ final class PastableTextField: NSTextField {
     }
 }
 
+// MARK: - Custom station row view (label + clickable pin button)
+
+/// Custom NSView used as `NSMenuItem.view` for station rows. Renders the
+/// station name on the left and a clickable pin/unpin button on the right.
+/// Click on the row body plays the station; click on the pin button toggles
+/// the favorite without closing the menu.
+@MainActor
+final class StationRowView: NSView {
+    let station: Station
+    private let isLocked: Bool
+    private let isCurrent: Bool
+    private var isPinned: Bool
+    private let onPlay: (Station) -> Void
+    /// Returns the new pinned state (true = now pinned, false = now unpinned).
+    private let onTogglePin: (Station) -> Bool
+
+    private let leadingIndicator = NSTextField(labelWithString: "")
+    private let label = NSTextField(labelWithString: "")
+    private let pinButton = NSButton()
+    private var trackingArea: NSTrackingArea?
+    private var isHovering = false
+
+    init(station: Station,
+         isPinned: Bool,
+         isCurrent: Bool,
+         isLocked: Bool,
+         onPlay: @escaping (Station) -> Void,
+         onTogglePin: @escaping (Station) -> Bool) {
+        self.station = station
+        self.isPinned = isPinned
+        self.isCurrent = isCurrent
+        self.isLocked = isLocked
+        self.onPlay = onPlay
+        self.onTogglePin = onTogglePin
+        super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
+        autoresizingMask = [.width]
+
+        // Leading "▶" indicator when this is the current station
+        leadingIndicator.stringValue = isCurrent ? "▶" : ""
+        leadingIndicator.font = .menuFont(ofSize: 0)
+        leadingIndicator.alignment = .center
+        leadingIndicator.drawsBackground = false
+        leadingIndicator.isBordered = false
+        leadingIndicator.isEditable = false
+        leadingIndicator.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(leadingIndicator)
+
+        // Station name label
+        label.stringValue = station.displayName
+        label.font = .menuFont(ofSize: 0)
+        label.drawsBackground = false
+        label.isBordered = false
+        label.isEditable = false
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+
+        // Pin button
+        pinButton.bezelStyle = .inline
+        pinButton.isBordered = false
+        pinButton.imagePosition = .imageOnly
+        pinButton.target = self
+        pinButton.action = #selector(pinClicked)
+        pinButton.translatesAutoresizingMaskIntoConstraints = false
+        pinButton.isEnabled = !isLocked
+        addSubview(pinButton)
+
+        updatePinAppearance()
+        applyTextColors(hovering: false)
+
+        NSLayoutConstraint.activate([
+            leadingIndicator.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            leadingIndicator.centerYAnchor.constraint(equalTo: centerYAnchor),
+            leadingIndicator.widthAnchor.constraint(equalToConstant: 12),
+
+            label.leadingAnchor.constraint(equalTo: leadingIndicator.trailingAnchor, constant: 4),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: pinButton.leadingAnchor, constant: -8),
+
+            pinButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            pinButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            pinButton.widthAnchor.constraint(equalToConstant: 18),
+            pinButton.heightAnchor.constraint(equalToConstant: 18),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not implemented") }
+
+    private func updatePinAppearance() {
+        let name = isPinned ? "pin.fill" : "pin"
+        pinButton.image = NSImage(systemSymbolName: name, accessibilityDescription: isPinned ? "Unpin" : "Pin")
+        pinButton.contentTintColor = isPinned ? .systemYellow : .tertiaryLabelColor
+        pinButton.toolTip = isPinned ? "Unpin from Favorites" : "Pin to Favorites"
+    }
+
+    private func applyTextColors(hovering: Bool) {
+        let base: NSColor
+        if isLocked { base = .disabledControlTextColor }
+        else if hovering { base = .selectedMenuItemTextColor }
+        else { base = .controlTextColor }
+        label.textColor = base
+        leadingIndicator.textColor = base
+        // Keep pin tint readable against the blue hover background
+        if hovering && !isLocked && !isPinned {
+            pinButton.contentTintColor = .selectedMenuItemTextColor
+        } else {
+            pinButton.contentTintColor = isPinned ? .systemYellow : .tertiaryLabelColor
+        }
+    }
+
+    @objc private func pinClicked() {
+        guard !isLocked else { return }
+        isPinned = onTogglePin(station)
+        updatePinAppearance()
+        applyTextColors(hovering: isHovering)
+        // Do NOT close the menu — let the user pin multiple stations in a row.
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard !isLocked else { return }
+        let pt = convert(event.locationInWindow, from: nil)
+        // If the click is inside the pin button's frame, let NSButton handle it
+        if pinButton.frame.insetBy(dx: -4, dy: -4).contains(pt) {
+            super.mouseDown(with: event)
+            return
+        }
+        // Otherwise: play the station and dismiss the menu
+        onPlay(station)
+        enclosingMenuItem?.menu?.cancelTrackingWithoutAnimation()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let ta = trackingArea { removeTrackingArea(ta) }
+        let opts: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]
+        let ta = NSTrackingArea(rect: .zero, options: opts, owner: self, userInfo: nil)
+        addTrackingArea(ta)
+        trackingArea = ta
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+        applyTextColors(hovering: true)
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+        applyTextColors(hovering: false)
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if isHovering && !isLocked {
+            NSColor.selectedMenuItemColor.setFill()
+            bounds.fill()
+        }
+    }
+}
+
 // MARK: - Icy Metadata Observer
 
 @MainActor
@@ -637,29 +797,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
                 submenu.removeItem(last)
             }
 
-            // Footer hint
-            submenu.addItem(NSMenuItem.separator())
-            let hint = NSMenuItem(title: "⌥-click any station to pin/unpin",
-                                  action: nil, keyEquivalent: "")
-            hint.isEnabled = false
-            submenu.addItem(hint)
-
             stationsItem.submenu = submenu
             stationsItem.isEnabled = !locked
             menu.addItem(stationsItem)
-
-            // Pin / Unpin Current Station — discoverable alternative to ⌥-click
-            if let cur = currentStation {
-                let isPinned = favIds.contains(cur.id)
-                let pinItem = NSMenuItem(
-                    title: isPinned ? "★ Unpin \(cur.displayName)" : "☆ Pin \(cur.displayName)",
-                    action: #selector(toggleCurrentFavorite),
-                    keyEquivalent: ""
-                )
-                pinItem.target = self
-                pinItem.isEnabled = !locked
-                menu.addItem(pinItem)
-            }
 
             let refresh = NSMenuItem(title: "Refresh Stations",
                                      action: #selector(refreshStationsAction),
@@ -825,36 +965,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
     // MARK: - Menu Actions
 
-    @objc private func stationSelected(_ sender: NSMenuItem) {
-        guard let s = sender.representedObject as? Station else { return }
-        let optionDown = NSApp.currentEvent?.modifierFlags
-            .contains(.option) ?? false
-        if optionDown {
-            // ⌥-click: toggle favorite without starting playback
-            _ = Favorites.toggle(s.id)
-            rebuildMenu()
-        } else {
-            play(station: s)
-        }
-    }
-
-    @objc private func toggleCurrentFavorite() {
-        guard let cur = currentStation else { return }
-        _ = Favorites.toggle(cur.id)
-        rebuildMenu()
-    }
-
-    /// Builds an NSMenuItem for a station with the right title, target, state,
-    /// and favorite-star prefix.
+    /// Builds an NSMenuItem whose `.view` is a custom `StationRowView`
+    /// (label + clickable pin button).
     private func makeStationItem(_ s: Station, locked: Bool, isFavorite: Bool) -> NSMenuItem {
-        let prefix = isFavorite ? "★ " : "  "
-        let item = NSMenuItem(title: prefix + s.displayName,
-                              action: #selector(stationSelected(_:)),
-                              keyEquivalent: "")
-        item.target = self
+        let item = NSMenuItem(title: s.displayName, action: nil, keyEquivalent: "")
         item.representedObject = s
-        if s.id == currentStation?.id { item.state = .on }
-        item.isEnabled = !locked
+        let row = StationRowView(
+            station: s,
+            isPinned: isFavorite,
+            isCurrent: s.id == currentStation?.id,
+            isLocked: locked,
+            onPlay: { [weak self] station in self?.play(station: station) },
+            onTogglePin: { [weak self] station -> Bool in
+                guard let self else { return false }
+                let nowPinned = Favorites.toggle(station.id)
+                // Rebuild the top-level menu so the "★ FAVORITES" section refreshes
+                // next time the user opens the menu. Safe to call here — the menu
+                // is still open; we're just rebuilding the model.
+                self.rebuildMenu()
+                return nowPinned
+            }
+        )
+        item.view = row
         return item
     }
 
