@@ -18,6 +18,12 @@ struct Station: Hashable {
     let bitrate: Int
     let format: String
     let nowPlayingSource: NowPlayingSource
+
+    /// Compact identifier for log lines.
+    var shortNameForLog: String {
+        if case let .azuracast(shortcode, _) = nowPlayingSource { return shortcode }
+        return id
+    }
 }
 
 struct NowPlayingInfo: Equatable {
@@ -517,14 +523,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     private var refreshTimer: Timer?
     private var rateObserver: NSKeyValueObservation?
     private var icyDelegate: IcyMetadataDelegate?
+    private var itemStatusObserver: NSKeyValueObservation?
+    private var playWatchdog: DispatchWorkItem?
+    private var retryAttempt: Int = 0
 
     private let defaults = UserDefaults.standard
     private let kLastStation = "lastStationID"
     private let kVolume = "volume"
 
-    private var isPlaying: Bool {
-        player.timeControlStatus == .playing || player.timeControlStatus == .waitingToPlayAtSpecifiedRate
-    }
+    private var isPlaying: Bool { player.timeControlStatus == .playing }
+    private var isLoading: Bool { player.timeControlStatus == .waitingToPlayAtSpecifiedRate }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -543,12 +551,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
         let savedVolume = defaults.object(forKey: kVolume) as? Float ?? 0.8
         player.volume = savedVolume
-
-        // Latency tuning for live radio streams. Default AVPlayer behavior is to
-        // buffer ~10s of audio before starting playback so it never stalls — fine
-        // for a downloaded MP4, terrible for "I clicked a radio station and want
-        // sound now". Trading a tiny risk of a re-buffer event for instant start.
-        player.automaticallyWaitsToMinimizeStalling = false
+        // Keep AVPlayer's default automaticallyWaitsToMinimizeStalling=true for
+        // reliability (it manages re-buffering correctly on network hiccups).
+        // Per-play we use playImmediately(atRate:) below to override on demand.
 
         rateObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in
@@ -644,13 +649,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
     // MARK: - Playback
 
-    private func play(station: Station) {
+    private func play(station: Station, isRetry: Bool = false) {
         guard Activation.isActivated else {
             showActivationFlow()
             return
         }
-        if currentStation?.id == station.id, isPlaying { return }
+        if !isRetry, currentStation?.id == station.id, isPlaying { return }
 
+        if !isRetry { retryAttempt = 0 }
         currentStation = station
         defaults.set(station.id, forKey: kLastStation)
         nowPlaying = nil
@@ -663,9 +669,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             "AVURLAssetPreferPreciseDurationAndTimingKey": false
         ])
         let item = AVPlayerItem(asset: asset)
-        // Keep just enough buffered audio to play. Default is ~30–60s of forward
-        // buffer, which delays the first audible sample.
-        item.preferredForwardBufferDuration = 2
+        // Keep a small forward buffer (default is ~30–60s, way too much for live
+        // radio — system can refill 1s in milliseconds on a stable connection).
+        item.preferredForwardBufferDuration = 1
 
         // Hook up Icy metadata for non-AzuraCast streams
         if case .icyStream = station.nowPlayingSource {
@@ -678,16 +684,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             self.icyDelegate = nil
         }
 
+        // Observe item.status to catch hard failures (bad URL, server gone, etc.)
+        // before the watchdog timeout fires.
+        itemStatusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            Task { @MainActor in
+                guard let self, item.status == .failed else { return }
+                NSLog("AVPlayerItem failed for \(station.shortNameForLog): \(String(describing: item.error))")
+                self.handlePlaybackFailure(station: station, reason: "stream connection failed")
+            }
+        }
+
         player.replaceCurrentItem(with: item)
-        player.play()
+        // playImmediately(atRate:) starts playback as soon as any audio is decoded
+        // — same effect as automaticallyWaitsToMinimizeStalling=false, but scoped
+        // to this single play() call so re-buffering on network hiccups still uses
+        // safe default behavior.
+        player.playImmediately(atRate: 1.0)
+
+        // Watchdog: if we're not actually playing within 5s, retry once. Real
+        // playback typically starts in 0.5–2s; 5s means something silently failed.
+        playWatchdog?.cancel()
+        let stationID = station.id
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            // Skip if user already switched to a different station
+            guard self.currentStation?.id == stationID else { return }
+            if self.isPlaying { return }
+            self.handlePlaybackFailure(station: station, reason: "watchdog timeout (no audio after 5s)")
+        }
+        playWatchdog = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: watchdog)
 
         startRefreshTimer()
         Task { await refreshNowPlaying(for: station) }
     }
 
+    private func handlePlaybackFailure(station: Station, reason: String) {
+        // Cancel any pending watchdog
+        playWatchdog?.cancel()
+        playWatchdog = nil
+
+        retryAttempt += 1
+        if retryAttempt <= 1 {
+            NSLog("Playback failed (\(reason)) — retrying \(station.displayName)")
+            // Tear down failed item before recreating
+            player.replaceCurrentItem(with: nil)
+            // Brief delay before retry to let any half-open connection close
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.play(station: station, isRetry: true)
+            }
+        } else {
+            NSLog("Playback failed twice (\(reason)) — giving up on \(station.displayName)")
+            retryAttempt = 0
+            player.replaceCurrentItem(with: nil)
+            rebuildMenu()
+            // Fire-and-forget user notification (doesn't steal focus from menu)
+            let notif = NSUserNotification()
+            notif.title = "AI Radio"
+            notif.informativeText = "Couldn't start \(station.displayName). Click again to retry."
+            NSUserNotificationCenter.default.deliver(notif)
+        }
+    }
+
     private func togglePlayPause() {
         guard let cur = currentStation else { return }
-        if isPlaying {
+        if isPlaying || isLoading {
+            playWatchdog?.cancel()
             player.pause()
             refreshTimer?.invalidate()
         } else {
@@ -733,17 +795,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
         // Header: current station + state
         if let cur = currentStation {
-            let stateIcon: String = isPlaying ? "♪" : "■"
+            let stateIcon: String
+            if isPlaying { stateIcon = "♪" }
+            else if isLoading { stateIcon = "⋯" }
+            else { stateIcon = "■" }
             let header = NSMenuItem(title: "\(stateIcon)  \(cur.displayName)", action: nil, keyEquivalent: "")
             header.isEnabled = false
             menu.addItem(header)
 
-            if let np = nowPlaying {
+            if let np = nowPlaying, isPlaying {
                 let line = formatNowPlaying(np)
                 let item = NSMenuItem(title: "    \(line)", action: nil, keyEquivalent: "")
                 item.isEnabled = false
                 menu.addItem(item)
-            } else if isPlaying {
+            } else if isLoading {
                 let item = NSMenuItem(title: "    Loading…", action: nil, keyEquivalent: "")
                 item.isEnabled = false
                 menu.addItem(item)
