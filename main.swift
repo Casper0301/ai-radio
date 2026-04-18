@@ -544,6 +544,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         let savedVolume = defaults.object(forKey: kVolume) as? Float ?? 0.8
         player.volume = savedVolume
 
+        // Latency tuning for live radio streams. Default AVPlayer behavior is to
+        // buffer ~10s of audio before starting playback so it never stalls — fine
+        // for a downloaded MP4, terrible for "I clicked a radio station and want
+        // sound now". Trading a tiny risk of a re-buffer event for instant start.
+        player.automaticallyWaitsToMinimizeStalling = false
+
         rateObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in
                 self?.rebuildMenu()
@@ -650,10 +656,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         nowPlaying = nil
         rebuildMenu()
 
-        // Cache-bust query so AVPlayer doesn't try to range-request a live stream
-        var comps = URLComponents(url: station.listenURL, resolvingAgainstBaseURL: false)!
-        comps.queryItems = (comps.queryItems ?? []) + [URLQueryItem(name: "_t", value: String(Int(Date().timeIntervalSince1970)))]
-        let item = AVPlayerItem(url: comps.url ?? station.listenURL)
+        // Use AVURLAsset with precise-duration disabled — for live Icecast streams
+        // there's no useful duration to compute, and asking for it triggers extra
+        // network probing before playback starts.
+        let asset = AVURLAsset(url: station.listenURL, options: [
+            "AVURLAssetPreferPreciseDurationAndTimingKey": false
+        ])
+        let item = AVPlayerItem(asset: asset)
+        // Keep just enough buffered audio to play. Default is ~30–60s of forward
+        // buffer, which delays the first audible sample.
+        item.preferredForwardBufferDuration = 2
 
         // Hook up Icy metadata for non-AzuraCast streams
         if case .icyStream = station.nowPlayingSource {

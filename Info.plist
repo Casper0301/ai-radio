@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>no.casperschive.airadio</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>6</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>1.0.6</string>
     <key>CFBundleExecutable</key>
     <string>AIRadio</string>
     <key>CFBundlePackageType</key>
