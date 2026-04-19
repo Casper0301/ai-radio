@@ -355,6 +355,48 @@ final class PastableTextField: NSTextField {
     }
 }
 
+// MARK: - Shared image cache
+
+/// Static SF Symbol images shared by every StationRowView. Loading them once
+/// here avoids 90+ NSImage allocations per menu rebuild (45 stations × 2 states).
+@MainActor
+enum SharedImages {
+    static let pin: NSImage? = NSImage(systemSymbolName: "pin", accessibilityDescription: "Pin")
+    static let pinFill: NSImage? = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "Unpin")
+    static let radioWaves: NSImage? = {
+        let img = NSImage(systemSymbolName: "dot.radiowaves.left.and.right", accessibilityDescription: "AI Radio")
+        img?.isTemplate = true
+        return img
+    }()
+    static let lock: NSImage? = {
+        let img = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: "AI Radio (locked)")
+        img?.isTemplate = true
+        return img
+    }()
+}
+
+// MARK: - Shared SF Symbol image cache
+
+/// Static cache of SF Symbol images used across the app. Avoids the per-rebuild
+/// allocation cost of NSImage(systemSymbolName:) — at 45 stations × 2 pin icons
+/// per menu rebuild, that's ~90 wasted NSImage allocations on every state change
+/// (play/pause/loading), all garbage-collected milliseconds later.
+@MainActor
+enum AppIcons {
+    static let pin: NSImage? = NSImage(systemSymbolName: "pin", accessibilityDescription: "Pin")
+    static let pinFill: NSImage? = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "Unpin")
+    static let radioWaves: NSImage? = {
+        let img = NSImage(systemSymbolName: "dot.radiowaves.left.and.right", accessibilityDescription: "AI Radio")
+        img?.isTemplate = true
+        return img
+    }()
+    static let lock: NSImage? = {
+        let img = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: "AI Radio (locked)")
+        img?.isTemplate = true
+        return img
+    }()
+}
+
 // MARK: - Custom station row view (label + clickable pin button)
 
 /// Custom NSView used as `NSMenuItem.view` for station rows. Renders the
@@ -444,8 +486,7 @@ final class StationRowView: NSView {
     required init?(coder: NSCoder) { fatalError("not implemented") }
 
     private func updatePinAppearance() {
-        let name = isPinned ? "pin.fill" : "pin"
-        pinButton.image = NSImage(systemSymbolName: name, accessibilityDescription: isPinned ? "Unpin" : "Pin")
+        pinButton.image = isPinned ? SharedImages.pinFill : SharedImages.pin
         pinButton.contentTintColor = isPinned ? .systemYellow : .tertiaryLabelColor
         pinButton.toolTip = isPinned ? "Unpin from Favorites" : "Pin to Favorites"
     }
@@ -564,6 +605,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     private var itemStatusObserver: NSKeyValueObservation?
     private var playWatchdog: DispatchWorkItem?
     private var retryAttempt: Int = 0
+    /// Cached stations submenu — re-populated only when the underlying data
+    /// changes (stations loaded, current station changed, favorite toggled).
+    /// State-only changes (play/pause/loading) reuse the existing submenu.
+    private let stationsSubmenu: NSMenu = {
+        let m = NSMenu()
+        m.autoenablesItems = false
+        return m
+    }()
+    private var stationsSubmenuDirty = true
 
     private let defaults = UserDefaults.standard
     private let kLastStation = "lastStationID"
@@ -576,12 +626,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         NSApp.setActivationPolicy(.accessory)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            let symbol = Activation.isActivated ? "dot.radiowaves.left.and.right" : "lock.fill"
-            let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "AI Radio")
-            img?.isTemplate = true
-            button.image = img
-        }
+        statusItem.button?.image = Activation.isActivated ? SharedImages.radioWaves : SharedImages.lock
 
         menu = NSMenu()
         menu.autoenablesItems = false
@@ -614,16 +659,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     }
 
     private func updateMenuBarIcon() {
-        guard let button = statusItem.button else { return }
-        let symbol = Activation.isActivated ? "dot.radiowaves.left.and.right" : "lock.fill"
-        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "AI Radio")
-        img?.isTemplate = true
-        button.image = img
+        statusItem.button?.image = Activation.isActivated ? SharedImages.radioWaves : SharedImages.lock
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         player.pause()
+        player.replaceCurrentItem(with: nil)
         refreshTimer?.invalidate()
+        refreshTimer = nil
+        playWatchdog?.cancel()
+        playWatchdog = nil
+        rateObserver?.invalidate()
+        rateObserver = nil
+        itemStatusObserver?.invalidate()
+        itemStatusObserver = nil
+        icyDelegate = nil
     }
 
     // MARK: - Loading
@@ -639,6 +689,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
                let match = combined.first(where: { $0.id == last }) {
                 self.currentStation = match
             }
+            stationsSubmenuDirty = true
             rebuildMenu()
             if let cur = currentStation {
                 await refreshNowPlaying(for: cur)
@@ -646,6 +697,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         } catch {
             // Even if AzuraCast fails, keep Norwegian stations available.
             self.stations = combined
+            stationsSubmenuDirty = true
             NSLog("AzuraCast load failed: \(error)")
             rebuildMenu()
         }
@@ -696,9 +748,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         if !isRetry, currentStation?.id == station.id, isPlaying { return }
 
         if !isRetry { retryAttempt = 0 }
+        let stationChanged = currentStation?.id != station.id
         currentStation = station
         defaults.set(station.id, forKey: kLastStation)
         nowPlaying = nil
+        // Only mark stations submenu dirty if the *current* station actually
+        // changed — otherwise the ▶ indicator stays on the same row.
+        if stationChanged { stationsSubmenuDirty = true }
         rebuildMenu()
 
         // Use AVURLAsset with precise-duration disabled — for live Icecast streams
@@ -873,50 +929,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             menu.addItem(item)
         }
 
-        // Stations submenu — grouped by genre, with Favorites pinned at top
+        // Stations submenu — grouped by genre, with Favorites pinned at top.
+        // The submenu instance is cached in `stationsSubmenu`; we only
+        // re-populate it when the underlying data changed (dirty flag).
         if !stations.isEmpty {
             menu.addItem(NSMenuItem.separator())
             let stationsItem = NSMenuItem(title: "Stations  (\(stations.count))", action: nil, keyEquivalent: "")
-            let submenu = NSMenu()
-            submenu.autoenablesItems = false
-
-            let favIds = Favorites.ids
-            let pinned = stations.filter { favIds.contains($0.id) }
-                                 .sorted { $0.displayName.lowercased() < $1.displayName.lowercased() }
-
-            // ★ Favorites section (only shown if any pinned)
-            if !pinned.isEmpty {
-                let header = NSMenuItem(title: "— ★ FAVORITES  (\(pinned.count)) —",
-                                        action: nil, keyEquivalent: "")
-                header.isEnabled = false
-                submenu.addItem(header)
-                for s in pinned { submenu.addItem(makeStationItem(s, locked: locked, isFavorite: true)) }
-                submenu.addItem(NSMenuItem.separator())
+            if stationsSubmenuDirty {
+                rebuildStationsSubmenu(locked: locked)
+                stationsSubmenuDirty = false
             }
-
-            // Genre sections in curated order
-            let byGenre = Dictionary(grouping: stations, by: { $0.genre })
-            for genre in Genres.order {
-                guard let inGenre = byGenre[genre], !inGenre.isEmpty else { continue }
-                // Norwegian keeps insertion order; everything else is alphabetical
-                let sorted = (genre == "Norwegian") ? inGenre : inGenre.sorted {
-                    $0.displayName.lowercased() < $1.displayName.lowercased()
-                }
-                let header = NSMenuItem(title: "— \(genre.uppercased())  (\(sorted.count)) —",
-                                        action: nil, keyEquivalent: "")
-                header.isEnabled = false
-                submenu.addItem(header)
-                for s in sorted {
-                    submenu.addItem(makeStationItem(s, locked: locked, isFavorite: favIds.contains(s.id)))
-                }
-                submenu.addItem(NSMenuItem.separator())
-            }
-            // Trim trailing separator
-            if let last = submenu.items.last, last.isSeparatorItem {
-                submenu.removeItem(last)
-            }
-
-            stationsItem.submenu = submenu
+            stationsItem.submenu = stationsSubmenu
             stationsItem.isEnabled = !locked
             menu.addItem(stationsItem)
 
@@ -1121,6 +1144,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
     // MARK: - Menu Actions
 
+    /// Repopulates the cached `stationsSubmenu` — the expensive operation.
+    /// Allocates ~45 StationRowView instances; called only when stations,
+    /// favorites, or current station change.
+    private func rebuildStationsSubmenu(locked: Bool) {
+        stationsSubmenu.removeAllItems()
+
+        let favIds = Favorites.ids
+        let pinned = stations.filter { favIds.contains($0.id) }
+                             .sorted { $0.displayName.lowercased() < $1.displayName.lowercased() }
+
+        // ★ Favorites section (only shown if any pinned)
+        if !pinned.isEmpty {
+            let header = NSMenuItem(title: "— ★ FAVORITES  (\(pinned.count)) —",
+                                    action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            stationsSubmenu.addItem(header)
+            for s in pinned {
+                stationsSubmenu.addItem(makeStationItem(s, locked: locked, isFavorite: true))
+            }
+            stationsSubmenu.addItem(NSMenuItem.separator())
+        }
+
+        // Genre sections in curated order
+        let byGenre = Dictionary(grouping: stations, by: { $0.genre })
+        for genre in Genres.order {
+            guard let inGenre = byGenre[genre], !inGenre.isEmpty else { continue }
+            let sorted = (genre == "Norwegian") ? inGenre : inGenre.sorted {
+                $0.displayName.lowercased() < $1.displayName.lowercased()
+            }
+            let header = NSMenuItem(title: "— \(genre.uppercased())  (\(sorted.count)) —",
+                                    action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            stationsSubmenu.addItem(header)
+            for s in sorted {
+                stationsSubmenu.addItem(makeStationItem(s, locked: locked, isFavorite: favIds.contains(s.id)))
+            }
+            stationsSubmenu.addItem(NSMenuItem.separator())
+        }
+        // Trim trailing separator
+        if let last = stationsSubmenu.items.last, last.isSeparatorItem {
+            stationsSubmenu.removeItem(last)
+        }
+    }
+
     /// Builds an NSMenuItem whose `.view` is a custom `StationRowView`
     /// (label + clickable pin button).
     private func makeStationItem(_ s: Station, locked: Bool, isFavorite: Bool) -> NSMenuItem {
@@ -1135,9 +1202,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             onTogglePin: { [weak self] station -> Bool in
                 guard let self else { return false }
                 let nowPinned = Favorites.toggle(station.id)
-                // Rebuild the top-level menu so the "★ FAVORITES" section refreshes
-                // next time the user opens the menu. Safe to call here — the menu
-                // is still open; we're just rebuilding the model.
+                // Mark the submenu dirty so the "★ FAVORITES" section updates
+                // next time the user opens the menu. Safe to call mid-menu —
+                // we're just flipping a flag.
+                self.stationsSubmenuDirty = true
                 self.rebuildMenu()
                 return nowPinned
             }
