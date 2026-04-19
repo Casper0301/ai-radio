@@ -1,6 +1,7 @@
 import Cocoa
 import AVFoundation
 import MediaPlayer
+import ServiceManagement
 
 // MARK: - Models
 
@@ -117,6 +118,43 @@ enum Genres {
         let prefix = "Music Radio "
         if raw.hasPrefix(prefix) { return String(raw.dropFirst(prefix.count)) }
         return raw
+    }
+}
+
+// MARK: - Launch at Login
+
+@MainActor
+enum LaunchAtLogin {
+    /// Set to true the first time we attempt to register, so we don't keep
+    /// re-enabling after the user explicitly turned it off.
+    private static let kInitialized = "launch_at_login_initialized"
+
+    static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
+    static var requiresApproval: Bool { SMAppService.mainApp.status == .requiresApproval }
+
+    static func enable() throws { try SMAppService.mainApp.register() }
+    static func disable() throws { try SMAppService.mainApp.unregister() }
+
+    /// Returns the new enabled state.
+    @discardableResult
+    static func toggle() throws -> Bool {
+        if isEnabled { try disable(); return false }
+        try enable()
+        return true
+    }
+
+    /// Idempotent: enables launch-at-login the first time AI Radio runs on
+    /// this Mac. After that, respects whatever the user chose. Safe to call
+    /// every launch.
+    static func enableByDefaultOnFirstRun() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: kInitialized) else { return }
+        defaults.set(true, forKey: kInitialized)
+        do {
+            try enable()
+        } catch {
+            NSLog("Failed to enable launch-at-login on first run: \(error)")
+        }
     }
 }
 
@@ -563,6 +601,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         }
 
         setupRemoteCommands()
+        LaunchAtLogin.enableByDefaultOnFirstRun()
         rebuildMenu(loading: true)
         Task { await loadStations() }
 
@@ -928,11 +967,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             menu.addItem(activated)
         }
 
-        // Quit
+        // Settings
         menu.addItem(NSMenuItem.separator())
+        let launch = NSMenuItem(title: "Launch at Login",
+                                action: #selector(toggleLaunchAtLogin),
+                                keyEquivalent: "")
+        launch.target = self
+        launch.state = LaunchAtLogin.isEnabled ? .on : .off
+        if LaunchAtLogin.requiresApproval {
+            launch.title = "Launch at Login (approve in System Settings)"
+        }
+        menu.addItem(launch)
+
+        // Quit
         let quit = NSMenuItem(title: "Quit AI Radio", action: #selector(quitAction), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        do {
+            try LaunchAtLogin.toggle()
+            rebuildMenu()
+            // If macOS bumped us to .requiresApproval, point the user at the right place
+            if LaunchAtLogin.requiresApproval {
+                let alert = NSAlert()
+                alert.messageText = "Approval needed"
+                alert.informativeText = "macOS wants you to approve AI Radio in System Settings → General → Login Items. Open it now?"
+                alert.addButton(withTitle: "Open System Settings")
+                alert.addButton(withTitle: "Later")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Couldn't update Login Items"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
     }
 
     // MARK: - Activation UI
