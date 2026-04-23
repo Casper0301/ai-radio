@@ -605,6 +605,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     private var itemStatusObserver: NSKeyValueObservation?
     private var playWatchdog: DispatchWorkItem?
     private var retryAttempt: Int = 0
+    /// True when the user has pressed play and has NOT explicitly paused since.
+    /// The reconnect logic only kicks in while this is true — so a stall during
+    /// a focus session auto-recovers, but a user-initiated pause stays paused.
+    private var wantsToPlay: Bool = false
+    /// NotificationCenter tokens for the current AVPlayerItem (stall / end /
+    /// fail). Cleared when we replace the item.
+    private var itemNotificationTokens: [NSObjectProtocol] = []
+    /// System wake observer — triggers a reconnect after sleep so the radio
+    /// resumes automatically when the Mac wakes back up.
+    private var wakeObserver: NSObjectProtocol?
     /// Cached stations submenu — re-populated only when the underlying data
     /// changes (stations loaded, current station changed, favorite toggled).
     /// State-only changes (play/pause/loading) reuse the existing submenu.
@@ -638,14 +648,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         // reliability (it manages re-buffering correctly on network hiccups).
         // Per-play we use playImmediately(atRate:) below to override on demand.
 
-        rateObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
+        rateObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             Task { @MainActor in
-                self?.rebuildMenu()
-                self?.updateNowPlayingCenter()
+                guard let self else { return }
+                // Stable playback → reset exponential-backoff counter so the next
+                // hiccup gets a fast retry rather than inheriting the prior backoff.
+                if player.timeControlStatus == .playing {
+                    self.retryAttempt = 0
+                }
+                self.rebuildMenu()
+                self.updateNowPlayingCenter()
             }
         }
 
         setupRemoteCommands()
+        observeSystemWake()
         LaunchAtLogin.enableByDefaultOnFirstRun()
         rebuildMenu(loading: true)
         Task { await loadStations() }
@@ -663,6 +680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        wantsToPlay = false
         player.pause()
         player.replaceCurrentItem(with: nil)
         refreshTimer?.invalidate()
@@ -674,6 +692,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         itemStatusObserver?.invalidate()
         itemStatusObserver = nil
         icyDelegate = nil
+        removeItemNotifications()
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
+        wakeObserver = nil
     }
 
     // MARK: - Loading
@@ -747,6 +770,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         }
         if !isRetry, currentStation?.id == station.id, isPlaying { return }
 
+        // User intent: we want audio playing on this station. Stays true until
+        // the user explicitly pauses or quits — drives all the reconnect logic.
+        wantsToPlay = true
         if !isRetry { retryAttempt = 0 }
         let stationChanged = currentStation?.id != station.id
         currentStation = station
@@ -764,9 +790,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             "AVURLAssetPreferPreciseDurationAndTimingKey": false
         ])
         let item = AVPlayerItem(asset: asset)
-        // Keep a small forward buffer (default is ~30–60s, way too much for live
-        // radio — system can refill 1s in milliseconds on a stable connection).
-        item.preferredForwardBufferDuration = 1
+        // Let AVPlayer pick its default forward buffer (~30–60s). An earlier
+        // build pinned this to 1s for faster start, but that tiny headroom made
+        // every brief Wi-Fi stutter fatal — playback silently died mid-focus
+        // session. Reliability > half-second start-up latency.
 
         // Hook up Icy metadata for non-AzuraCast streams
         if case .icyStream = station.nowPlayingSource {
@@ -785,9 +812,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             Task { @MainActor in
                 guard let self, item.status == .failed else { return }
                 NSLog("AVPlayerItem failed for \(station.shortNameForLog): \(String(describing: item.error))")
-                self.handlePlaybackFailure(station: station, reason: "stream connection failed")
+                self.scheduleReconnect(station: station, reason: "stream failed")
             }
         }
+
+        // Stream-level notifications catch the mid-playback failure cases
+        // (silent stall, server closes the connection, decoder error). Without
+        // these, AVPlayer transitions to .paused and nothing reconnects it.
+        installItemNotifications(for: item, station: station)
 
         player.replaceCurrentItem(with: item)
         // playImmediately(atRate:) starts playback as soon as any audio is decoded
@@ -796,16 +828,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         // safe default behavior.
         player.playImmediately(atRate: 1.0)
 
-        // Watchdog: if we're not actually playing within 5s, retry once. Real
-        // playback typically starts in 0.5–2s; 5s means something silently failed.
+        // Start-of-playback watchdog: if nothing is playing within 5s, kick the
+        // reconnect loop. Ongoing-playback failures are handled by the item
+        // notifications and the periodic health check inside startRefreshTimer.
         playWatchdog?.cancel()
         let stationID = station.id
         let watchdog = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            // Skip if user already switched to a different station
             guard self.currentStation?.id == stationID else { return }
-            if self.isPlaying { return }
-            self.handlePlaybackFailure(station: station, reason: "watchdog timeout (no audio after 5s)")
+            if self.isPlaying || self.isLoading { return }
+            self.scheduleReconnect(station: station, reason: "no audio after 5s")
         }
         playWatchdog = watchdog
         DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: watchdog)
@@ -814,50 +846,122 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         Task { await refreshNowPlaying(for: station) }
     }
 
-    private func handlePlaybackFailure(station: Station, reason: String) {
-        // Cancel any pending watchdog
+    /// Unlimited-retry reconnect with exponential backoff (0.5s → 30s cap).
+    /// Focus sessions shouldn't die from a 30-second Wi-Fi blip, so we keep
+    /// trying until the user explicitly pauses or switches stations.
+    private func scheduleReconnect(station: Station, reason: String) {
         playWatchdog?.cancel()
         playWatchdog = nil
 
+        guard wantsToPlay, currentStation?.id == station.id else { return }
+
         retryAttempt += 1
-        if retryAttempt <= 1 {
-            NSLog("Playback failed (\(reason)) — retrying \(station.displayName)")
-            // Tear down failed item before recreating
-            player.replaceCurrentItem(with: nil)
-            // Brief delay before retry to let any half-open connection close
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.play(station: station, isRetry: true)
+        let delay = min(pow(2.0, Double(retryAttempt - 1)) * 0.5, 30.0)
+        NSLog("Reconnecting \(station.displayName) in \(String(format: "%.1f", delay))s (attempt \(retryAttempt), reason: \(reason))")
+
+        // Tear the failed item down immediately so the menu shows "reconnecting"
+        // and any lingering buffers/sockets release.
+        player.replaceCurrentItem(with: nil)
+        removeItemNotifications()
+        rebuildMenu()
+
+        let stationID = station.id
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.wantsToPlay, self.currentStation?.id == stationID else { return }
+            self.play(station: station, isRetry: true)
+        }
+        playWatchdog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// Install notifications that fire when the current item stalls, silently
+    /// ends, or fails mid-playback. These are the common causes of "radio just
+    /// stopped" during long sessions.
+    private func installItemNotifications(for item: AVPlayerItem, station: Station) {
+        removeItemNotifications()
+        let nc = NotificationCenter.default
+        let names: [Notification.Name] = [
+            AVPlayerItem.playbackStalledNotification,
+            AVPlayerItem.didPlayToEndTimeNotification,
+            AVPlayerItem.failedToPlayToEndTimeNotification,
+        ]
+        for name in names {
+            let token = nc.addObserver(forName: name, object: item, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    self?.scheduleReconnect(station: station, reason: name.rawValue)
+                }
             }
-        } else {
-            NSLog("Playback failed twice (\(reason)) — giving up on \(station.displayName)")
-            retryAttempt = 0
-            player.replaceCurrentItem(with: nil)
-            rebuildMenu()
-            // Fire-and-forget user notification (doesn't steal focus from menu)
-            let notif = NSUserNotification()
-            notif.title = "AI Radio"
-            notif.informativeText = "Couldn't start \(station.displayName). Click again to retry."
-            NSUserNotificationCenter.default.deliver(notif)
+            itemNotificationTokens.append(token)
+        }
+    }
+
+    private func removeItemNotifications() {
+        for token in itemNotificationTokens {
+            NotificationCenter.default.removeObserver(token)
+        }
+        itemNotificationTokens.removeAll()
+    }
+
+    /// Auto-resume after the Mac wakes from sleep. Without this, laptop-lid-open
+    /// kills the focus session because the stream socket was dead before the
+    /// Mac slept.
+    private func observeSystemWake() {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.wantsToPlay, let cur = self.currentStation else { return }
+                NSLog("System woke — reconnecting \(cur.displayName)")
+                self.retryAttempt = 0
+                self.scheduleReconnect(station: cur, reason: "system wake")
+            }
         }
     }
 
     private func togglePlayPause() {
         guard let cur = currentStation else { return }
-        if isPlaying || isLoading {
-            playWatchdog?.cancel()
-            player.pause()
-            refreshTimer?.invalidate()
+        if isPlaying || isLoading || wantsToPlay {
+            userRequestedPause()
         } else {
             play(station: cur)
         }
+    }
+
+    /// Explicit user pause. Sets wantsToPlay=false so the reconnect logic
+    /// leaves the stream alone until the user hits play again.
+    private func userRequestedPause() {
+        wantsToPlay = false
+        playWatchdog?.cancel()
+        playWatchdog = nil
+        player.pause()
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        removeItemNotifications()
+        rebuildMenu()
     }
 
     private func startRefreshTimer() {
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, let cur = self.currentStation, self.isPlaying else { return }
-                await self.refreshNowPlaying(for: cur)
+                guard let self, let cur = self.currentStation else { return }
+                // Health check: if user wants playback but the player has gone
+                // silent (no notification fired, just drifted to paused), kick
+                // a reconnect. Belt-and-suspenders against the "silent stop"
+                // that was killing focus sessions.
+                if self.wantsToPlay,
+                   !self.isPlaying,
+                   !self.isLoading,
+                   self.playWatchdog == nil {
+                    NSLog("Health check: not playing while wantsToPlay — reconnecting \(cur.displayName)")
+                    self.scheduleReconnect(station: cur, reason: "health check")
+                    return
+                }
+                if self.isPlaying {
+                    await self.refreshNowPlaying(for: cur)
+                }
             }
         }
     }
@@ -890,9 +994,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
         // Header: current station + state
         if let cur = currentStation {
+            let reconnecting = wantsToPlay && !isPlaying && !isLoading
             let stateIcon: String
             if isPlaying { stateIcon = "♪" }
             else if isLoading { stateIcon = "⋯" }
+            else if reconnecting { stateIcon = "⟳" }
             else { stateIcon = "■" }
             let header = NSMenuItem(title: "\(stateIcon)  \(cur.displayName)", action: nil, keyEquivalent: "")
             header.isEnabled = false
@@ -907,12 +1013,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
                 let item = NSMenuItem(title: "    Loading…", action: nil, keyEquivalent: "")
                 item.isEnabled = false
                 menu.addItem(item)
+            } else if reconnecting {
+                let item = NSMenuItem(title: "    Reconnecting…", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
             }
 
             menu.addItem(NSMenuItem.separator())
 
             let toggle = NSMenuItem(
-                title: isPlaying ? "Pause" : "Play",
+                title: (isPlaying || isLoading || wantsToPlay) ? "Pause" : "Play",
                 action: #selector(togglePlayPauseAction),
                 keyEquivalent: " "
             )
@@ -1249,7 +1359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             return .success
         }
         cc.pauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.player.pause(); self?.refreshTimer?.invalidate() }
+            Task { @MainActor in self?.userRequestedPause() }
             return .success
         }
         cc.togglePlayPauseCommand.addTarget { [weak self] _ in
@@ -1285,11 +1395,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             return
         }
 
+        // PlaybackRate is the canonical "actively playing" signal for macOS's
+        // MediaRemote service. Tools like Wispr Flow ("mute music while dictating")
+        // look at this to decide which app is currently producing audio and should
+        // be paused. Without it, AI Radio registers with MediaRemote but appears
+        // idle, so those tools skip it and our stream keeps playing during dictation.
         let info: [String: Any] = [
             MPMediaItemPropertyTitle: nowPlaying.map { formatNowPlaying($0) } ?? cur.displayName,
             MPMediaItemPropertyArtist: cur.displayName,
             MPNowPlayingInfoPropertyIsLiveStream: true,
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
         ]
 
         if let artURL = nowPlaying?.artURL {

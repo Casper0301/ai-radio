@@ -12,3 +12,4 @@ MusicRadio.app/
 .vscode/
 .idea/
 *.swp
+.firecrawl/
