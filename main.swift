@@ -1066,13 +1066,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         let volItem = NSMenuItem(title: "Volume  (\(Int(player.volume * 100))%)",
                                  action: nil, keyEquivalent: "")
         let volMenu = NSMenu()
-        for v in [0, 25, 50, 75, 100] {
+        // Finer steps at the low end so quiet background listening is possible —
+        // the old 0 → 25% jump was too big for a lo-fi-while-working use case.
+        // Match each step to the current volume with a tight tolerance so the
+        // checkmark lands on the right row regardless of which bucket we hit.
+        let steps: [Int] = [0, 5, 10, 15, 25, 50, 75, 100]
+        let currentPercent = Int((player.volume * 100).rounded())
+        for v in steps {
             let f = Float(v) / 100.0
             let title = v == 0 ? "Mute" : "\(v)%"
             let mi = NSMenuItem(title: title, action: #selector(setVolume(_:)), keyEquivalent: "")
             mi.target = self
             mi.representedObject = f
-            if abs(player.volume - f) < 0.05 { mi.state = .on }
+            if currentPercent == v { mi.state = .on }
             mi.isEnabled = !locked
             volMenu.addItem(mi)
         }
