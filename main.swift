@@ -624,6 +624,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         return m
     }()
     private var stationsSubmenuDirty = true
+    /// Timestamp of the last time `timeControlStatus` was observed as `.playing`.
+    /// Used by the health check to distinguish a transient stall (AVPlayer is
+    /// rebuffering; leave it alone) from a sustained outage (reconnect).
+    private var lastPlayingAt: Date = .distantPast
 
     private let defaults = UserDefaults.standard
     private let kLastStation = "lastStationID"
@@ -653,8 +657,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
                 guard let self else { return }
                 // Stable playback → reset exponential-backoff counter so the next
                 // hiccup gets a fast retry rather than inheriting the prior backoff.
+                // Also stamp lastPlayingAt so the health check knows we're alive.
                 if player.timeControlStatus == .playing {
                     self.retryAttempt = 0
+                    self.lastPlayingAt = Date()
                 }
                 self.rebuildMenu()
                 self.updateNowPlayingCenter()
@@ -790,10 +796,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             "AVURLAssetPreferPreciseDurationAndTimingKey": false
         ])
         let item = AVPlayerItem(asset: asset)
-        // Let AVPlayer pick its default forward buffer (~30–60s). An earlier
-        // build pinned this to 1s for faster start, but that tiny headroom made
-        // every brief Wi-Fi stutter fatal — playback silently died mid-focus
-        // session. Reliability > half-second start-up latency.
+        // ~10s of forward buffer is the sweet spot for a 192 kbps live stream:
+        // big enough to survive a Wi-Fi roam or VPN reconnect, small enough that
+        // memory stays trivial and the user doesn't sit through a long initial
+        // fill before audio. AVPlayer's default heuristic (30–60s) is overkill
+        // for radio and has been observed to delay first-audio noticeably.
+        item.preferredForwardBufferDuration = 10.0
 
         // Hook up Icy metadata for non-AzuraCast streams
         if case .icyStream = station.nowPlayingSource {
@@ -822,11 +830,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         installItemNotifications(for: item, station: station)
 
         player.replaceCurrentItem(with: item)
-        // playImmediately(atRate:) starts playback as soon as any audio is decoded
-        // — same effect as automaticallyWaitsToMinimizeStalling=false, but scoped
-        // to this single play() call so re-buffering on network hiccups still uses
-        // safe default behavior.
+        // playImmediately(atRate:) starts playback as soon as audio is decoded —
+        // saves ~1s of initial buffering vs. plain play(). The catch: it has a
+        // documented side effect of permanently flipping
+        // automaticallyWaitsToMinimizeStalling=false on the AVPlayer instance.
+        // Without explicitly restoring it below, every minor Wi-Fi stutter would
+        // produce a stall instead of letting AVPlayer rebuffer transparently —
+        // which is exactly the "music keeps lagging and stopping" symptom.
         player.playImmediately(atRate: 1.0)
+        // Restore the default stall-handling so subsequent network hiccups get
+        // rebuffered by AVPlayer natively, instead of producing audible stalls
+        // that we then over-react to with a full reconnect.
+        player.automaticallyWaitsToMinimizeStalling = true
+        // Optimistic stamp: gives us a 30s grace window in the health check
+        // before any false-positive reconnect.
+        lastPlayingAt = Date()
 
         // Start-of-playback watchdog: if nothing is playing within 5s, kick the
         // reconnect loop. Ongoing-playback failures are handled by the item
@@ -874,14 +892,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    /// Install notifications that fire when the current item stalls, silently
-    /// ends, or fails mid-playback. These are the common causes of "radio just
-    /// stopped" during long sessions.
+    /// Install notifications that fire when the current item silently ends or
+    /// fails mid-playback. These are *hard* failures (server closed connection,
+    /// decode error) and warrant an immediate reconnect.
+    ///
+    /// We deliberately do NOT observe `playbackStalledNotification`: a stall
+    /// just means "buffer underflow"; with `automaticallyWaitsToMinimizeStalling`
+    /// set to true, AVPlayer rebuffers and resumes on its own. Reconnecting on
+    /// every stall turned a 200ms hiccup into a 3–10s silence — the original
+    /// "music lags and stops" complaint. The 30-second health check (in
+    /// `startRefreshTimer`) is the safety net for stalls that don't recover.
     private func installItemNotifications(for item: AVPlayerItem, station: Station) {
         removeItemNotifications()
         let nc = NotificationCenter.default
         let names: [Notification.Name] = [
-            AVPlayerItem.playbackStalledNotification,
             AVPlayerItem.didPlayToEndTimeNotification,
             AVPlayerItem.failedToPlayToEndTimeNotification,
         ]
@@ -947,15 +971,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, let cur = self.currentStation else { return }
-                // Health check: if user wants playback but the player has gone
-                // silent (no notification fired, just drifted to paused), kick
-                // a reconnect. Belt-and-suspenders against the "silent stop"
-                // that was killing focus sessions.
+                // Health check: if the user wants playback but we haven't been
+                // `.playing` for >30 seconds, something's stuck. This catches
+                // both "silent pause" (rate drifted to 0 with no notification)
+                // AND "stuck rebuffering" (AVPlayer in waitingToPlay forever
+                // because the network is gone). Transient stalls under 30s are
+                // intentionally tolerated — AVPlayer rebuffers them transparently.
                 if self.wantsToPlay,
                    !self.isPlaying,
-                   !self.isLoading,
-                   self.playWatchdog == nil {
-                    NSLog("Health check: not playing while wantsToPlay — reconnecting \(cur.displayName)")
+                   self.playWatchdog == nil,
+                   Date().timeIntervalSince(self.lastPlayingAt) > 30 {
+                    NSLog("Health check: no audio for >30s — reconnecting \(cur.displayName)")
                     self.scheduleReconnect(station: cur, reason: "health check")
                     return
                 }
