@@ -268,6 +268,51 @@ enum NorwegianRadio {
     }
 }
 
+// MARK: - SomaFM (curated instrumental electronic family)
+
+/// SomaFM has been running ad-free, listener-supported Icecast since 2000 and is
+/// the most reliable public source for instrumental electronic / downtempo /
+/// ambient radio. We pull a curated subset that matches the AI Radio vibe:
+/// consistent "chilled electronic" feel across channels, with intensity
+/// variations from drone-ambient (Drone Zone) to deep-house (Beat Blender).
+///
+/// URL pattern: https://ice5.somafm.com/<slug>-128-mp3 (ice3 is the documented
+/// fallback if ice5 is overloaded). MP3 at 128 kbps matches the bitrate ceiling
+/// that AVPlayer handles cleanly for live Icecast — higher rates increase
+/// rebuffering risk without audible benefit on radio content.
+///
+/// ICY StreamTitle metadata is broadcast on every channel so the menu's
+/// now-playing line populates via the existing IcyMetadataDelegate path.
+enum SomaFM {
+    static let stations: [Station] = [
+        // Chill & Focus — ambient, downtempo, low-energy
+        s("soma:groovesalad",   "Groove Salad",         "groovesalad",   "Chill & Focus"),
+        s("soma:gsclassic",     "Groove Salad Classic", "gsclassic",     "Chill & Focus"),
+        s("soma:dronezone",     "Drone Zone",           "dronezone",     "Chill & Focus"),
+        s("soma:deepspaceone",  "Deep Space One",       "deepspaceone",  "Chill & Focus"),
+        s("soma:spacestation",  "Space Station Soma",   "spacestation",  "Chill & Focus"),
+        s("soma:missioncontrol","Mission Control",      "missioncontrol","Chill & Focus"),
+        // Electronic — beat-driven, deep house, IDM
+        s("soma:beatblender",   "Beat Blender",         "beatblender",   "Electronic"),
+        s("soma:cliqhop",       "cliqhop idm",          "cliqhop",       "Electronic"),
+        s("soma:defcon",        "DEF CON Radio",        "defcon",        "Electronic"),
+        s("soma:fluid",         "Fluid",                "fluid",         "Electronic"),
+    ]
+
+    private static func s(_ id: String, _ name: String, _ slug: String, _ genre: String) -> Station {
+        Station(
+            id: id,
+            name: name,
+            displayName: name,
+            genre: genre,
+            listenURL: URL(string: "https://ice5.somafm.com/\(slug)-128-mp3")!,
+            bitrate: 128,
+            format: "mp3",
+            nowPlayingSource: .icyStream
+        )
+    }
+}
+
 // MARK: - Activation (email capture + free license key)
 
 enum ActivationError: LocalizedError {
@@ -708,8 +753,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     // MARK: - Loading
 
     private func loadStations() async {
-        // Norwegian stations are static; AzuraCast is fetched.
-        var combined = NorwegianRadio.stations
+        // Norwegian + SomaFM stations are static; AzuraCast is fetched.
+        // Order matters only for tie-breaking inside a genre bucket — the menu
+        // groups by `Station.genre` so all "Chill & Focus" stations appear
+        // together regardless of which source list they came from.
+        var combined = NorwegianRadio.stations + SomaFM.stations
         do {
             let ai = try await AzuraCast.fetchStations(baseURL: AzuraCast.musicRadioBase)
             combined.append(contentsOf: ai)
