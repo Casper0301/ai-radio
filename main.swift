@@ -295,7 +295,6 @@ enum SomaFM {
         s("soma:synphaera",     "Synphaera",            "synphaera",     "Chill & Focus"),
         // Electronic — beat-driven, deep house, melodic
         s("soma:beatblender",   "Beat Blender",         "beatblender",   "Electronic"),
-        s("soma:cliqhop",       "cliqhop idm",          "cliqhop",       "Electronic"),
         s("soma:defcon",        "DEF CON Radio",        "defcon",        "Electronic"),
         s("soma:fluid",         "Fluid",                "fluid",         "Electronic"),
         s("soma:thetrip",       "The Trip",             "thetrip",       "Electronic"),
