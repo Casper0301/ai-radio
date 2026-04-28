@@ -292,11 +292,15 @@ enum SomaFM {
         s("soma:deepspaceone",  "Deep Space One",       "deepspaceone",  "Chill & Focus"),
         s("soma:spacestation",  "Space Station Soma",   "spacestation",  "Chill & Focus"),
         s("soma:missioncontrol","Mission Control",      "missioncontrol","Chill & Focus"),
-        // Electronic — beat-driven, deep house, IDM
+        s("soma:synphaera",     "Synphaera",            "synphaera",     "Chill & Focus"),
+        // Electronic — beat-driven, deep house, melodic
         s("soma:beatblender",   "Beat Blender",         "beatblender",   "Electronic"),
         s("soma:cliqhop",       "cliqhop idm",          "cliqhop",       "Electronic"),
         s("soma:defcon",        "DEF CON Radio",        "defcon",        "Electronic"),
         s("soma:fluid",         "Fluid",                "fluid",         "Electronic"),
+        s("soma:thetrip",       "The Trip",             "thetrip",       "Electronic"),
+        s("soma:secretagent",   "Secret Agent",         "secretagent",   "Electronic"),
+        s("soma:lush",          "Lush",                 "lush",          "Electronic"),
     ]
 
     private static func s(_ id: String, _ name: String, _ slug: String, _ genre: String) -> Station {
