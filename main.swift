@@ -1,5 +1,6 @@
 import Cocoa
 import AVFoundation
+import CoreAudio
 import MediaPlayer
 import ServiceManagement
 
@@ -180,6 +181,95 @@ enum Favorites {
     }
 }
 
+// MARK: - System output volume
+
+/// The menu's volume control moves the *system output device's* volume, not
+/// AVPlayer's software gain.
+///
+/// Software gain scales the decoded PCM before it ever reaches the device, so
+/// listening at "10%" meant sending a signal 20 dB down the wire and then making
+/// it back up in the speaker's own amp — which brings the amp's noise floor and,
+/// on Bluetooth, the codec's quantisation artefacts up with it. Driving the
+/// device volume instead keeps the stream at full scale all the way to the DAC,
+/// and on a Bluetooth speaker it maps to AVRCP absolute volume, i.e. the
+/// speaker's own analogue stage.
+enum SystemVolume {
+    private static func defaultOutputDevice() -> AudioObjectID? {
+        var id = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let err = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                             &addr, 0, nil, &size, &id)
+        return (err == noErr && id != AudioObjectID(kAudioObjectUnknown)) ? id : nil
+    }
+
+    /// Main element first, then the first two channels: plenty of USB and
+    /// virtual devices expose no main volume control but do expose per-channel.
+    private static let elements: [AudioObjectPropertyElement] = [kAudioObjectPropertyElementMain, 1, 2]
+
+    private static func volumeAddress(_ element: AudioObjectPropertyElement) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
+                                   mScope: kAudioDevicePropertyScopeOutput,
+                                   mElement: element)
+    }
+
+    /// Current output volume 0...1, or nil when the default device has no
+    /// software-readable volume control (some aggregate / virtual devices).
+    static func get() -> Float? {
+        guard let dev = defaultOutputDevice() else { return nil }
+        for element in elements {
+            var addr = volumeAddress(element)
+            guard AudioObjectHasProperty(dev, &addr) else { continue }
+            var value: Float32 = 0
+            var size = UInt32(MemoryLayout<Float32>.size)
+            if AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &value) == noErr {
+                return Float(value)
+            }
+        }
+        return nil
+    }
+
+    /// Returns false when nothing on the default device was settable — the
+    /// caller then falls back to AVPlayer gain so the control still works.
+    @discardableResult
+    static func set(_ value: Float) -> Bool {
+        guard let dev = defaultOutputDevice() else { return false }
+        var scalar = Float32(min(max(value, 0), 1))
+        let size = UInt32(MemoryLayout<Float32>.size)
+        var didSet = false
+        for element in elements {
+            var addr = volumeAddress(element)
+            guard AudioObjectHasProperty(dev, &addr) else { continue }
+            var settable: DarwinBoolean = false
+            guard AudioObjectIsPropertySettable(dev, &addr, &settable) == noErr, settable.boolValue else { continue }
+            if AudioObjectSetPropertyData(dev, &addr, 0, nil, size, &scalar) == noErr {
+                didSet = true
+                // The main element already covers every channel.
+                if element == kAudioObjectPropertyElementMain { break }
+            }
+        }
+        // Keep the device's mute flag in sync so "Mute" behaves like the
+        // hardware key, and any non-zero step un-mutes.
+        if didSet { setMuted(scalar <= 0.0001, on: dev) }
+        return didSet
+    }
+
+    private static func setMuted(_ muted: Bool, on device: AudioObjectID) {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute,
+                                              mScope: kAudioDevicePropertyScopeOutput,
+                                              mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectHasProperty(device, &addr) else { return }
+        var settable: DarwinBoolean = false
+        guard AudioObjectIsPropertySettable(device, &addr, &settable) == noErr, settable.boolValue else { return }
+        var flag: UInt32 = muted ? 1 : 0
+        _ = AudioObjectSetPropertyData(device, &addr, 0, nil,
+                                       UInt32(MemoryLayout<UInt32>.size), &flag)
+    }
+}
+
 // MARK: - AzuraCast API
 
 enum AzuraCast {
@@ -247,7 +337,7 @@ enum AzuraCast {
 enum NorwegianRadio {
     static let stations: [Station] = [
         s("no:nrk_p1", "NRK P1",  "https://cdn0-47115-liveicecast0.dna.contentdelivery.net/p1_mp3_h",  192, "mp3"),
-        s("no:nrk_p2", "NRK P2",  "https://cdn0-47115-liveicecast0.dna.contentdelivery.net/p2_aac_h",  159, "aac"),
+        s("no:nrk_p2", "NRK P2",  "https://cdn0-47115-liveicecast0.dna.contentdelivery.net/p2_mp3_h",  192, "mp3"),
         s("no:nrk_p3", "NRK P3",  "https://cdn0-47115-liveicecast0.dna.contentdelivery.net/p3_mp3_h",  192, "mp3"),
         s("no:p4",     "P4 Norge","https://p4.p4groupaudio.com/P04_AH",                                192, "aac"),
         s("no:nrj",    "NRJ Norge","https://live-bauerno.sharp-stream.com/kiss_no_mp3",               128, "mp3"),
@@ -276,40 +366,45 @@ enum NorwegianRadio {
 /// consistent "chilled electronic" feel across channels, with intensity
 /// variations from drone-ambient (Drone Zone) to deep-house (Beat Blender).
 ///
-/// URL pattern: https://ice5.somafm.com/<slug>-128-mp3 (ice3 is the documented
-/// fallback if ice5 is overloaded). MP3 at 128 kbps matches the bitrate ceiling
-/// that AVPlayer handles cleanly for live Icecast — higher rates increase
-/// rebuffering risk without audible benefit on radio content.
+/// URL pattern: https://ice5.somafm.com/<slug>-<bitrate>-mp3 (ice2/ice6 are the
+/// documented alternates if ice5 is overloaded). Bitrate is per channel: SomaFM
+/// publishes 256k (320k for Space Station) on some channels and 128k on the
+/// rest, so each row carries its own highest *public* MP3 mount, verified
+/// against https://somafm.com/channels.json.
+///
+/// The 128k channels also have a `-128-aac` mount, but at equal bitrate that is
+/// a lateral move, and several of them are HE-AAC (22.05 kHz core + synthesised
+/// highs) — so we stay on MP3 wherever AAC would not raise the bitrate.
 ///
 /// ICY StreamTitle metadata is broadcast on every channel so the menu's
 /// now-playing line populates via the existing IcyMetadataDelegate path.
 enum SomaFM {
     static let stations: [Station] = [
         // Chill & Focus — ambient, downtempo, low-energy
-        s("soma:groovesalad",   "Groove Salad",         "groovesalad",   "Chill & Focus"),
-        s("soma:gsclassic",     "Groove Salad Classic", "gsclassic",     "Chill & Focus"),
-        s("soma:dronezone",     "Drone Zone",           "dronezone",     "Chill & Focus"),
-        s("soma:deepspaceone",  "Deep Space One",       "deepspaceone",  "Chill & Focus"),
-        s("soma:spacestation",  "Space Station Soma",   "spacestation",  "Chill & Focus"),
-        s("soma:missioncontrol","Mission Control",      "missioncontrol","Chill & Focus"),
-        s("soma:synphaera",     "Synphaera",            "synphaera",     "Chill & Focus"),
+        s("soma:groovesalad",   "Groove Salad",         "groovesalad",   "Chill & Focus", 256),
+        s("soma:gsclassic",     "Groove Salad Classic", "gsclassic",     "Chill & Focus", 128),
+        s("soma:dronezone",     "Drone Zone",           "dronezone",     "Chill & Focus", 256),
+        s("soma:deepspaceone",  "Deep Space One",       "deepspaceone",  "Chill & Focus", 128),
+        s("soma:spacestation",  "Space Station Soma",   "spacestation",  "Chill & Focus", 320),
+        s("soma:missioncontrol","Mission Control",      "missioncontrol","Chill & Focus", 128),
+        s("soma:synphaera",     "Synphaera",            "synphaera",     "Chill & Focus", 256),
         // Electronic — beat-driven, deep house, melodic
-        s("soma:beatblender",   "Beat Blender",         "beatblender",   "Electronic"),
-        s("soma:defcon",        "DEF CON Radio",        "defcon",        "Electronic"),
-        s("soma:fluid",         "Fluid",                "fluid",         "Electronic"),
-        s("soma:thetrip",       "The Trip",             "thetrip",       "Electronic"),
-        s("soma:secretagent",   "Secret Agent",         "secretagent",   "Electronic"),
-        s("soma:lush",          "Lush",                 "lush",          "Electronic"),
+        s("soma:beatblender",   "Beat Blender",         "beatblender",   "Electronic",    128),
+        s("soma:defcon",        "DEF CON Radio",        "defcon",        "Electronic",    256),
+        s("soma:fluid",         "Fluid",                "fluid",         "Electronic",    128),
+        s("soma:thetrip",       "The Trip",             "thetrip",       "Electronic",    128),
+        s("soma:secretagent",   "Secret Agent",         "secretagent",   "Electronic",    128),
+        s("soma:lush",          "Lush",                 "lush",          "Electronic",    128),
     ]
 
-    private static func s(_ id: String, _ name: String, _ slug: String, _ genre: String) -> Station {
+    private static func s(_ id: String, _ name: String, _ slug: String, _ genre: String, _ bitrate: Int) -> Station {
         Station(
             id: id,
             name: name,
             displayName: name,
             genre: genre,
-            listenURL: URL(string: "https://ice5.somafm.com/\(slug)-128-mp3")!,
-            bitrate: 128,
+            listenURL: URL(string: "https://ice5.somafm.com/\(slug)-\(bitrate)-mp3")!,
+            bitrate: bitrate,
             format: "mp3",
             nowPlayingSource: .icyStream
         )
@@ -694,8 +789,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         menu.autoenablesItems = false
         statusItem.menu = menu
 
-        let savedVolume = defaults.object(forKey: kVolume) as? Float ?? 0.8
-        player.volume = savedVolume
+        // Full-scale PCM to the output device, always: any attenuation happens in
+        // the device's own volume control (see SystemVolume), never here.
+        player.volume = 1.0
+        migrateStoredVolumeToSystemVolume()
         // Keep AVPlayer's default automaticallyWaitsToMinimizeStalling=true for
         // reliability (it manages re-buffering correctly on network hiccups).
         // Per-play we use playImmediately(atRate:) below to override on demand.
@@ -1140,7 +1237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
         // Volume submenu
         menu.addItem(NSMenuItem.separator())
-        let volItem = NSMenuItem(title: "Volume  (\(Int(player.volume * 100))%)",
+        let volItem = NSMenuItem(title: "System Volume  (\(Int((currentVolume * 100).rounded()))%)",
                                  action: nil, keyEquivalent: "")
         let volMenu = NSMenu()
         // Finer steps at the low end so quiet background listening is possible —
@@ -1148,7 +1245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         // Match each step to the current volume with a tight tolerance so the
         // checkmark lands on the right row regardless of which bucket we hit.
         let steps: [Int] = [0, 5, 10, 15, 25, 50, 75, 100]
-        let currentPercent = Int((player.volume * 100).rounded())
+        let currentPercent = Int((currentVolume * 100).rounded())
         for v in steps {
             let f = Float(v) / 100.0
             let title = v == 0 ? "Mute" : "\(v)%"
@@ -1415,9 +1512,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
     @objc private func setVolume(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? Float else { return }
-        player.volume = v
-        defaults.set(v, forKey: kVolume)
+        if SystemVolume.set(v) {
+            // System volume persists in macOS itself — nothing for us to store.
+            player.volume = 1.0
+        } else {
+            // No settable volume on the default output device (some aggregate
+            // and virtual devices): fall back to software gain so the control
+            // still does something.
+            player.volume = v
+        }
         rebuildMenu()
+    }
+
+    /// Volume the menu displays: the output device's own level when it has one,
+    /// otherwise whatever software gain we fell back to.
+    private var currentVolume: Float { SystemVolume.get() ?? player.volume }
+
+    /// One-time migration off the old software-gain volume: fold the stored
+    /// in-app level into the system output volume so first launch after the
+    /// upgrade sounds exactly as loud as before. It can only ever lower the
+    /// system volume, never raise it.
+    private func migrateStoredVolumeToSystemVolume() {
+        guard let stored = defaults.object(forKey: kVolume) as? Float else { return }
+        if stored < 0.999, let system = SystemVolume.get() {
+            SystemVolume.set(system * stored)
+        }
+        defaults.removeObject(forKey: kVolume)
     }
 
     @objc private func openInBrowser(_ sender: NSMenuItem) {
