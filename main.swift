@@ -9,7 +9,7 @@ enum NowPlayingSource: Hashable {
     case azuracast(shortcode: String, baseURL: URL)
     case icyStream
     /// Locally synthesized Endel-style sound-therapy hum — no network source.
-    case generatedHum
+    case generatedHum(frequency: Double)
 }
 
 struct Station: Hashable {
@@ -95,6 +95,7 @@ enum Genres {
     static let order: [String] = [
         "Norwegian",
         "Mixed",
+        "Hz Therapy",
         "Chill & Focus",
         "Classical",
         "Country",
@@ -330,16 +331,23 @@ enum SomaFM {
 /// sub-octave drone that breathes slowly, with a whisper of low texture for
 /// warmth. No stream on the internet serves this reliably, and a fixed-tone
 /// drone is exactly what a synthesizer is for.
-enum HummingFocus {
-    static let station = Station(
-        id: "hum:852",
-        name: "Humming Focus — Solfeggio 852 Hz",
-        displayName: "Humming Focus",
-        genre: "Chill & Focus",
-        listenURL: URL(string: "hum://852")!,
-        bitrate: 0,
-        format: "Generated",
-        nowPlayingSource: .generatedHum)
+enum HzTherapy {
+    /// The full Solfeggio scale plus the popular 432 Hz calm tuning, low → high.
+    /// No single frequency is scientifically "optimal" — the whole scale is
+    /// here so the user can pick by ear, exactly like Endel's tone channels.
+    static let frequencies: [Int] = [174, 285, 396, 417, 432, 528, 639, 741, 852, 963]
+
+    static let stations: [Station] = frequencies.map { f in
+        Station(
+            id: "hum:\(f)",
+            name: "Solfeggio \(f) Hz",
+            displayName: "\(f) Hz",
+            genre: "Hz Therapy",
+            listenURL: URL(string: "hum://\(f)")!,
+            bitrate: 0,
+            format: "Generated",
+            nowPlayingSource: .generatedHum(frequency: Double(f)))
+    }
 }
 
 /// Renders the hum into a pre-computed stereo buffer and loops it on an
@@ -354,6 +362,7 @@ final class HumEngine {
     /// exactly like `AVPlayer.volume` drives streams.
     private let gainMixer = AVAudioMixerNode()
     private var buffer: AVAudioPCMBuffer?
+    private var bufferFreq: Double = 0
     private var fadeTimer: Timer?
     private var appVolume: Float = 1.0
     /// Mirrors "audio is audible" for the app's isPlaying logic. Drops false
@@ -365,12 +374,15 @@ final class HumEngine {
         engine.attach(gainMixer)
     }
 
-    func start(volume: Float) {
+    func start(volume: Float, frequency: Double) {
         appVolume = volume
         fadeTimer?.invalidate()
         fadeTimer = nil
 
-        if buffer == nil { buffer = Self.renderBuffer() }
+        if buffer == nil || bufferFreq != frequency {
+            buffer = Self.renderBuffer(base: frequency)
+            bufferFreq = frequency
+        }
         guard let buffer else { return }
 
         // Reconnect every start: after engine.stop() the scheduled buffer is
@@ -390,13 +402,15 @@ final class HumEngine {
         node.play()
         playing = true
         // Fade in from silence so channel switches never thump.
-        rampGain(to: appVolume, over: 1.2)
+        rampGain(to: appVolume, over: 0.8)
     }
 
     func stopPlayback() {
         guard playing || engine.isRunning else { return }
         playing = false
-        rampGain(to: 0, over: 0.7) { [weak self] in
+        // Short duck, not a musical fade-out: pause/switch must feel instant.
+        // 80 ms is enough to avoid a click yet reads as immediate.
+        rampGain(to: 0, over: 0.08) { [weak self] in
             guard let self, !self.playing else { return }
             self.node.stop()
             self.engine.stop()
@@ -411,10 +425,11 @@ final class HumEngine {
 
     private func rampGain(to target: Float, over seconds: TimeInterval, done: (() -> Void)? = nil) {
         fadeTimer?.invalidate()
-        let steps = max(Int(seconds / 0.033), 1)
+        let interval = 0.016            // ~60 Hz steps: smooth even for 80 ms ducks
+        let steps = max(Int(seconds / interval), 1)
         let from = gainMixer.volume
         var step = 0
-        fadeTimer = Timer.scheduledTimer(withTimeInterval: 0.033, repeats: true) { [weak self] t in
+        fadeTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] t in
             guard let self else { t.invalidate(); return }
             step += 1
             if step >= steps || !self.engine.isRunning {
@@ -431,10 +446,13 @@ final class HumEngine {
         }
     }
 
-    /// 12 s stereo loop: 852 Hz Solfeggio tone + 426/213 Hz drone octaves +
+    /// 12 s stereo loop: the base Solfeggio tone + f/2 and f/4 drone octaves +
     /// decorrelated low texture partials. All frequencies are integer cycles
-    /// per buffer, so the loop is seamless.
-    private static func renderBuffer() -> AVAudioPCMBuffer? {
+    /// per buffer (f, f/2, f/4 are integer multiples of 1/12 Hz for integer f),
+    /// so the loop is seamless. Levels are tuned ~10 dB under the first cut:
+    /// a background therapy bed, not a soloist — at full app volume it should
+    /// sit clearly behind speech.
+    private static func renderBuffer(base f: Double) -> AVAudioPCMBuffer? {
         let seconds = 12.0
         let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
         let frames = AVAudioFrameCount(seconds * 44_100)
@@ -454,8 +472,8 @@ final class HumEngine {
         var textureR: [(freq: Double, amp: Float, phase: Double)] = []
         for _ in 0..<8 {
             let k = 1140 + Int(rnd() * 3000)          // ~95–345 Hz
-            textureL.append((Double(k) / seconds, 0.006 + rnd() * 0.010, Double(rnd())))
-            textureR.append((Double(k) / seconds, 0.006 + rnd() * 0.010, Double(rnd())))
+            textureL.append((Double(k) / seconds, 0.002 + rnd() * 0.003, Double(rnd())))
+            textureR.append((Double(k) / seconds, 0.002 + rnd() * 0.003, Double(rnd())))
         }
 
         let L = buf.floatChannelData![0]
@@ -465,9 +483,9 @@ final class HumEngine {
             let t = Double(i) / 44_100
             // Breathing drone: one full AM cycle per buffer (periodic).
             let breath = 1.0 - 0.25 + 0.25 * sin(tau * t / seconds)
-            let tone: Double = 0.16 * sin(tau * 852 * t)
-            let octave: Double = 0.20 * sin(tau * 426 * t + 0.7)
-            let hum: Double = 0.34 * breath * sin(tau * 213 * t)
+            let tone: Double = 0.045 * sin(tau * f * t)
+            let octave: Double = 0.055 * sin(tau * f / 2 * t + 0.7)
+            let hum: Double = 0.095 * breath * sin(tau * f / 4 * t)
             let core = tone + octave + hum
             var l: Double = core
             var r: Double = core
@@ -632,8 +650,6 @@ final class StationRowView: NSView {
     private let leadingIndicator = NSTextField(labelWithString: "")
     private let label = NSTextField(labelWithString: "")
     private let pinButton = NSButton()
-    private var trackingArea: NSTrackingArea?
-    private var isHovering = false
 
     init(station: Station,
          isPinned: Bool,
@@ -726,8 +742,18 @@ final class StationRowView: NSView {
         guard !isLocked else { return }
         isPinned = onTogglePin(station)
         updatePinAppearance()
-        applyTextColors(hovering: isHovering)
+        applyTextColors(hovering: isHighlighted())
         // Do NOT close the menu — let the user pin multiple stations in a row.
+    }
+
+    /// The menu's own notion of "cursor is on this row". Hand-rolled
+    /// NSTrackingArea hover proved unreliable here: in the tall scrolling
+    /// stations submenu (and when the menu closes mid-hover) macOS does not
+    /// reliably deliver mouseExited, so rows stayed blue wherever the cursor
+    /// had been. NSMenuItem.isHighlighted is maintained by the menu's real
+    /// tracking session and can never go stale.
+    private func isHighlighted() -> Bool {
+        enclosingMenuItem?.isHighlighted == true && !isLocked
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -743,32 +769,15 @@ final class StationRowView: NSView {
         enclosingMenuItem?.menu?.cancelTrackingWithoutAnimation()
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let ta = trackingArea { removeTrackingArea(ta) }
-        let opts: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]
-        let ta = NSTrackingArea(rect: .zero, options: opts, owner: self, userInfo: nil)
-        addTrackingArea(ta)
-        trackingArea = ta
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHovering = true
-        applyTextColors(hovering: true)
-        needsDisplay = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovering = false
-        applyTextColors(hovering: false)
-        needsDisplay = true
-    }
-
     override func draw(_ dirtyRect: NSRect) {
-        if isHovering && !isLocked {
+        let hovering = isHighlighted()
+        if hovering {
             NSColor.selectedMenuItemColor.setFill()
             bounds.fill()
         }
+        // Text colors must follow the menu's highlight (not a cached hover
+        // flag) so they're correct on every redraw, including after scroll.
+        applyTextColors(hovering: hovering)
     }
 }
 
@@ -933,7 +942,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         // Order matters only for tie-breaking inside a genre bucket — the menu
         // groups by `Station.genre` so all "Chill & Focus" stations appear
         // together regardless of which source list they came from.
-        var combined = [HummingFocus.station] + NorwegianRadio.stations + SomaFM.stations
+        var combined = HzTherapy.stations + NorwegianRadio.stations + SomaFM.stations
         do {
             let ai = try await AzuraCast.fetchStations(baseURL: AzuraCast.musicRadioBase)
             combined.append(contentsOf: ai)
@@ -1095,15 +1104,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     }
 
     /// Generated channel: no network, no AVPlayer item, no watchdogs — just
-    /// the synthesis engine. Reuses the same health-check/reconnect machinery
-    /// (via startRefreshTimer) in the unlikely case the audio engine dies.
+    /// the synthesis engine at the station's Solfeggio frequency. Reuses the
+    /// same health-check/reconnect machinery (via startRefreshTimer) in the
+    /// unlikely case the audio engine dies.
     private func startHum(_ station: Station) {
+        guard case let .generatedHum(freq) = station.nowPlayingSource else { return }
         wantsToPlay = true
         retryAttempt = 0
         let stationChanged = currentStation?.id != station.id
         currentStation = station
         defaults.set(station.id, forKey: kLastStation)
-        nowPlaying = NowPlayingInfo(artist: "Solfeggio Tones", title: "852 Hz — Humming Focus", artURL: nil)
+        nowPlaying = NowPlayingInfo(artist: "Solfeggio Tones", title: "\(Int(freq)) Hz · Sound Therapy", artURL: nil)
         if stationChanged { stationsSubmenuDirty = true }
 
         // Tear down any stream state before the engine takes over.
@@ -1116,7 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         playWatchdog?.cancel()
         playWatchdog = nil
 
-        humEngine.start(volume: defaults.object(forKey: kVolume) as? Float ?? 1.0)
+        humEngine.start(volume: defaults.object(forKey: kVolume) as? Float ?? 1.0, frequency: freq)
         lastPlayingAt = Date()
         rebuildMenu()
         updateNowPlayingCenter()
