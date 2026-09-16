@@ -8,6 +8,8 @@ import ServiceManagement
 enum NowPlayingSource: Hashable {
     case azuracast(shortcode: String, baseURL: URL)
     case icyStream
+    /// Locally synthesized Endel-style sound-therapy hum — no network source.
+    case generatedHum
 }
 
 struct Station: Hashable {
@@ -318,6 +320,167 @@ enum SomaFM {
             format: "mp3",
             nowPlayingSource: .icyStream
         )
+    }
+}
+
+// MARK: - Humming Focus (generated sound-therapy channel)
+
+/// The one channel AI Radio generates locally instead of streaming — an
+/// Endel-style "Solfeggio Tones 852 Hz" focus hum: a pure 852 Hz tone over a
+/// sub-octave drone that breathes slowly, with a whisper of low texture for
+/// warmth. No stream on the internet serves this reliably, and a fixed-tone
+/// drone is exactly what a synthesizer is for.
+enum HummingFocus {
+    static let station = Station(
+        id: "hum:852",
+        name: "Humming Focus — Solfeggio 852 Hz",
+        displayName: "Humming Focus",
+        genre: "Chill & Focus",
+        listenURL: URL(string: "hum://852")!,
+        bitrate: 0,
+        format: "Generated",
+        nowPlayingSource: .generatedHum)
+}
+
+/// Renders the hum into a pre-computed stereo buffer and loops it on an
+/// AVAudioPlayerNode. Every frequency is an exact multiple of 1/12 Hz so the
+/// 12-second buffer is perfectly periodic — the loop seam is inaudible by
+/// construction, not by crossfading.
+@MainActor
+final class HumEngine {
+    private let engine = AVAudioEngine()
+    private let node = AVAudioPlayerNode()
+    /// Dedicated gain stage so the app's in-app volume slider drives this node
+    /// exactly like `AVPlayer.volume` drives streams.
+    private let gainMixer = AVAudioMixerNode()
+    private var buffer: AVAudioPCMBuffer?
+    private var fadeTimer: Timer?
+    private var appVolume: Float = 1.0
+    /// Mirrors "audio is audible" for the app's isPlaying logic. Drops false
+    /// the instant a stop is requested, even while the fade-out tail runs.
+    private(set) var playing = false
+
+    init() {
+        engine.attach(node)
+        engine.attach(gainMixer)
+    }
+
+    func start(volume: Float) {
+        appVolume = volume
+        fadeTimer?.invalidate()
+        fadeTimer = nil
+
+        if buffer == nil { buffer = Self.renderBuffer() }
+        guard let buffer else { return }
+
+        // Reconnect every start: after engine.stop() the scheduled buffer is
+        // gone, and the formats never change between runs.
+        engine.disconnectNodeOutput(node)
+        engine.disconnectNodeOutput(gainMixer)
+        engine.connect(node, to: gainMixer, format: buffer.format)
+        engine.connect(gainMixer, to: engine.mainMixerNode, format: buffer.format)
+
+        do {
+            try engine.start()
+        } catch {
+            NSLog("HumEngine: failed to start engine \(error)")
+            return
+        }
+        node.scheduleBuffer(buffer, at: nil, options: .loops)
+        node.play()
+        playing = true
+        // Fade in from silence so channel switches never thump.
+        rampGain(to: appVolume, over: 1.2)
+    }
+
+    func stopPlayback() {
+        guard playing || engine.isRunning else { return }
+        playing = false
+        rampGain(to: 0, over: 0.7) { [weak self] in
+            guard let self, !self.playing else { return }
+            self.node.stop()
+            self.engine.stop()
+        }
+    }
+
+    /// In-app volume slider while the hum is the current channel.
+    func setVolume(_ v: Float) {
+        appVolume = v
+        if playing { rampGain(to: v, over: 0.15) }
+    }
+
+    private func rampGain(to target: Float, over seconds: TimeInterval, done: (() -> Void)? = nil) {
+        fadeTimer?.invalidate()
+        let steps = max(Int(seconds / 0.033), 1)
+        let from = gainMixer.volume
+        var step = 0
+        fadeTimer = Timer.scheduledTimer(withTimeInterval: 0.033, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            step += 1
+            if step >= steps || !self.engine.isRunning {
+                self.gainMixer.volume = target
+                t.invalidate()
+                self.fadeTimer = nil
+                done?()
+            } else {
+                let f = Float(step) / Float(steps)
+                let fromV = from
+                let targetV = target
+                self.gainMixer.volume = fromV + (targetV - fromV) * f
+            }
+        }
+    }
+
+    /// 12 s stereo loop: 852 Hz Solfeggio tone + 426/213 Hz drone octaves +
+    /// decorrelated low texture partials. All frequencies are integer cycles
+    /// per buffer, so the loop is seamless.
+    private static func renderBuffer() -> AVAudioPCMBuffer? {
+        let seconds = 12.0
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
+        let frames = AVAudioFrameCount(seconds * 44_100)
+        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+        buf.frameLength = frames
+
+        // Tiny deterministic LCG so builds are reproducible.
+        var rngState: UInt64 = 852
+        func rnd() -> Float {
+            rngState = rngState &* 6364136223846793005 &+ 1442695040888963407
+            return Float((rngState >> 33) & 0xFFFF) / Float(0xFFFF)
+        }
+
+        // Texture partials: k full cycles over the buffer, k chosen so the
+        // frequency lands roughly between 90 and 360 Hz (k = f * 12).
+        var textureL: [(freq: Double, amp: Float, phase: Double)] = []
+        var textureR: [(freq: Double, amp: Float, phase: Double)] = []
+        for _ in 0..<8 {
+            let k = 1140 + Int(rnd() * 3000)          // ~95–345 Hz
+            textureL.append((Double(k) / seconds, 0.006 + rnd() * 0.010, Double(rnd())))
+            textureR.append((Double(k) / seconds, 0.006 + rnd() * 0.010, Double(rnd())))
+        }
+
+        let L = buf.floatChannelData![0]
+        let R = buf.floatChannelData![1]
+        let tau = 2.0 * Double.pi
+        for i in 0..<Int(frames) {
+            let t = Double(i) / 44_100
+            // Breathing drone: one full AM cycle per buffer (periodic).
+            let breath = 1.0 - 0.25 + 0.25 * sin(tau * t / seconds)
+            let tone: Double = 0.16 * sin(tau * 852 * t)
+            let octave: Double = 0.20 * sin(tau * 426 * t + 0.7)
+            let hum: Double = 0.34 * breath * sin(tau * 213 * t)
+            let core = tone + octave + hum
+            var l: Double = core
+            var r: Double = core
+            for p in textureL {
+                l += Double(p.amp) * sin(tau * p.freq * t + p.phase)
+            }
+            for p in textureR {
+                r += Double(p.amp) * sin(tau * p.freq * t + p.phase)
+            }
+            L[i] = Float(l)
+            R[i] = Float(r)
+        }
+        return buf
     }
 }
 
@@ -655,6 +818,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     private var refreshTimer: Timer?
     private var rateObserver: NSKeyValueObservation?
     private var icyDelegate: IcyMetadataDelegate?
+    /// Locally generated Humming Focus channel engine (idle unless that
+    /// station is the active one).
+    private let humEngine = HumEngine()
     private var itemStatusObserver: NSKeyValueObservation?
     private var playWatchdog: DispatchWorkItem?
     private var retryAttempt: Int = 0
@@ -686,8 +852,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
     private let kLastStation = "lastStationID"
     private let kVolume = "volume"
 
-    private var isPlaying: Bool { player.timeControlStatus == .playing }
-    private var isLoading: Bool { player.timeControlStatus == .waitingToPlayAtSpecifiedRate }
+    private var isPlaying: Bool { humEngine.playing || player.timeControlStatus == .playing }
+    private var isLoading: Bool { !humEngine.playing && player.timeControlStatus == .waitingToPlayAtSpecifiedRate }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -741,6 +907,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
     func applicationWillTerminate(_ notification: Notification) {
         wantsToPlay = false
+        humEngine.stopPlayback()
         player.pause()
         player.replaceCurrentItem(with: nil)
         refreshTimer?.invalidate()
@@ -766,7 +933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         // Order matters only for tie-breaking inside a genre bucket — the menu
         // groups by `Station.genre` so all "Chill & Focus" stations appear
         // together regardless of which source list they came from.
-        var combined = NorwegianRadio.stations + SomaFM.stations
+        var combined = [HummingFocus.station] + NorwegianRadio.stations + SomaFM.stations
         do {
             let ai = try await AzuraCast.fetchStations(baseURL: AzuraCast.musicRadioBase)
             combined.append(contentsOf: ai)
@@ -832,6 +999,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
             return
         }
         if !isRetry, currentStation?.id == station.id, isPlaying { return }
+
+        if case .generatedHum = station.nowPlayingSource {
+            startHum(station)
+            return
+        }
+        humEngine.stopPlayback()
 
         // User intent: we want audio playing on this station. Stays true until
         // the user explicitly pauses or quits — drives all the reconnect logic.
@@ -919,6 +1092,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
         startRefreshTimer()
         Task { await refreshNowPlaying(for: station) }
+    }
+
+    /// Generated channel: no network, no AVPlayer item, no watchdogs — just
+    /// the synthesis engine. Reuses the same health-check/reconnect machinery
+    /// (via startRefreshTimer) in the unlikely case the audio engine dies.
+    private func startHum(_ station: Station) {
+        wantsToPlay = true
+        retryAttempt = 0
+        let stationChanged = currentStation?.id != station.id
+        currentStation = station
+        defaults.set(station.id, forKey: kLastStation)
+        nowPlaying = NowPlayingInfo(artist: "Solfeggio Tones", title: "852 Hz — Humming Focus", artURL: nil)
+        if stationChanged { stationsSubmenuDirty = true }
+
+        // Tear down any stream state before the engine takes over.
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        icyDelegate = nil
+        itemStatusObserver?.invalidate()
+        itemStatusObserver = nil
+        removeItemNotifications()
+        playWatchdog?.cancel()
+        playWatchdog = nil
+
+        humEngine.start(volume: defaults.object(forKey: kVolume) as? Float ?? 1.0)
+        lastPlayingAt = Date()
+        rebuildMenu()
+        updateNowPlayingCenter()
+        startRefreshTimer()
     }
 
     /// Unlimited-retry reconnect with exponential backoff (0.5s → 30s cap).
@@ -1016,6 +1218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         wantsToPlay = false
         playWatchdog?.cancel()
         playWatchdog = nil
+        humEngine.stopPlayback()
         player.pause()
         refreshTimer?.invalidate()
         refreshTimer = nil
@@ -1423,6 +1626,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         guard let v = sender.representedObject as? Float else { return }
         player.volume = v
         defaults.set(v, forKey: kVolume)
+        humEngine.setVolume(v)
         rebuildMenu()
     }
 
