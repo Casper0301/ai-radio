@@ -17,13 +17,13 @@ SWIFT_OPTS="-Osize -wmo"
 
 swiftc $SWIFT_OPTS \
     -target arm64-apple-macos13.0 \
-    -framework Cocoa -framework AVFoundation -framework CoreAudio -framework MediaPlayer -framework ServiceManagement \
+    -framework Cocoa -framework AVFoundation -framework MediaPlayer -framework ServiceManagement \
     -o "$APP/Contents/MacOS/${EXEC}-arm64" \
     main.swift
 
 swiftc $SWIFT_OPTS \
     -target x86_64-apple-macos13.0 \
-    -framework Cocoa -framework AVFoundation -framework CoreAudio -framework MediaPlayer -framework ServiceManagement \
+    -framework Cocoa -framework AVFoundation -framework MediaPlayer -framework ServiceManagement \
     -o "$APP/Contents/MacOS/${EXEC}-x86_64" \
     main.swift
 

@@ -181,95 +181,6 @@ enum Favorites {
     }
 }
 
-// MARK: - System output volume
-
-/// The menu's volume control moves the *system output device's* volume, not
-/// AVPlayer's software gain.
-///
-/// Software gain scales the decoded PCM before it ever reaches the device, so
-/// listening at "10%" meant sending a signal 20 dB down the wire and then making
-/// it back up in the speaker's own amp — which brings the amp's noise floor and,
-/// on Bluetooth, the codec's quantisation artefacts up with it. Driving the
-/// device volume instead keeps the stream at full scale all the way to the DAC,
-/// and on a Bluetooth speaker it maps to AVRCP absolute volume, i.e. the
-/// speaker's own analogue stage.
-enum SystemVolume {
-    private static func defaultOutputDevice() -> AudioObjectID? {
-        var id = AudioObjectID(kAudioObjectUnknown)
-        var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        let err = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
-                                             &addr, 0, nil, &size, &id)
-        return (err == noErr && id != AudioObjectID(kAudioObjectUnknown)) ? id : nil
-    }
-
-    /// Main element first, then the first two channels: plenty of USB and
-    /// virtual devices expose no main volume control but do expose per-channel.
-    private static let elements: [AudioObjectPropertyElement] = [kAudioObjectPropertyElementMain, 1, 2]
-
-    private static func volumeAddress(_ element: AudioObjectPropertyElement) -> AudioObjectPropertyAddress {
-        AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
-                                   mScope: kAudioDevicePropertyScopeOutput,
-                                   mElement: element)
-    }
-
-    /// Current output volume 0...1, or nil when the default device has no
-    /// software-readable volume control (some aggregate / virtual devices).
-    static func get() -> Float? {
-        guard let dev = defaultOutputDevice() else { return nil }
-        for element in elements {
-            var addr = volumeAddress(element)
-            guard AudioObjectHasProperty(dev, &addr) else { continue }
-            var value: Float32 = 0
-            var size = UInt32(MemoryLayout<Float32>.size)
-            if AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &value) == noErr {
-                return Float(value)
-            }
-        }
-        return nil
-    }
-
-    /// Returns false when nothing on the default device was settable — the
-    /// caller then falls back to AVPlayer gain so the control still works.
-    @discardableResult
-    static func set(_ value: Float) -> Bool {
-        guard let dev = defaultOutputDevice() else { return false }
-        var scalar = Float32(min(max(value, 0), 1))
-        let size = UInt32(MemoryLayout<Float32>.size)
-        var didSet = false
-        for element in elements {
-            var addr = volumeAddress(element)
-            guard AudioObjectHasProperty(dev, &addr) else { continue }
-            var settable: DarwinBoolean = false
-            guard AudioObjectIsPropertySettable(dev, &addr, &settable) == noErr, settable.boolValue else { continue }
-            if AudioObjectSetPropertyData(dev, &addr, 0, nil, size, &scalar) == noErr {
-                didSet = true
-                // The main element already covers every channel.
-                if element == kAudioObjectPropertyElementMain { break }
-            }
-        }
-        // Keep the device's mute flag in sync so "Mute" behaves like the
-        // hardware key, and any non-zero step un-mutes.
-        if didSet { setMuted(scalar <= 0.0001, on: dev) }
-        return didSet
-    }
-
-    private static func setMuted(_ muted: Bool, on device: AudioObjectID) {
-        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute,
-                                              mScope: kAudioDevicePropertyScopeOutput,
-                                              mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectHasProperty(device, &addr) else { return }
-        var settable: DarwinBoolean = false
-        guard AudioObjectIsPropertySettable(device, &addr, &settable) == noErr, settable.boolValue else { return }
-        var flag: UInt32 = muted ? 1 : 0
-        _ = AudioObjectSetPropertyData(device, &addr, 0, nil,
-                                       UInt32(MemoryLayout<UInt32>.size), &flag)
-    }
-}
-
 // MARK: - AzuraCast API
 
 enum AzuraCast {
@@ -789,10 +700,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
         menu.autoenablesItems = false
         statusItem.menu = menu
 
-        // Full-scale PCM to the output device, always: any attenuation happens in
-        // the device's own volume control (see SystemVolume), never here.
-        player.volume = 1.0
-        migrateStoredVolumeToSystemVolume()
+        // In-app volume only: software gain on AVPlayer, independent of the
+        // system output volume. Full scale on first run.
+        player.volume = defaults.object(forKey: kVolume) as? Float ?? 1.0
         // Keep AVPlayer's default automaticallyWaitsToMinimizeStalling=true for
         // reliability (it manages re-buffering correctly on network hiccups).
         // Per-play we use playImmediately(atRate:) below to override on demand.
@@ -1237,7 +1147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
         // Volume submenu
         menu.addItem(NSMenuItem.separator())
-        let volItem = NSMenuItem(title: "System Volume  (\(Int((currentVolume * 100).rounded()))%)",
+        let volItem = NSMenuItem(title: "Volume  (\(Int((currentVolume * 100).rounded()))%)",
                                  action: nil, keyEquivalent: "")
         let volMenu = NSMenu()
         // Finer steps at the low end so quiet background listening is possible —
@@ -1512,33 +1422,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, IcyMetadataReceiver {
 
     @objc private func setVolume(_ sender: NSMenuItem) {
         guard let v = sender.representedObject as? Float else { return }
-        if SystemVolume.set(v) {
-            // System volume persists in macOS itself — nothing for us to store.
-            player.volume = 1.0
-        } else {
-            // No settable volume on the default output device (some aggregate
-            // and virtual devices): fall back to software gain so the control
-            // still does something.
-            player.volume = v
-        }
+        player.volume = v
+        defaults.set(v, forKey: kVolume)
         rebuildMenu()
     }
 
-    /// Volume the menu displays: the output device's own level when it has one,
-    /// otherwise whatever software gain we fell back to.
-    private var currentVolume: Float { SystemVolume.get() ?? player.volume }
-
-    /// One-time migration off the old software-gain volume: fold the stored
-    /// in-app level into the system output volume so first launch after the
-    /// upgrade sounds exactly as loud as before. It can only ever lower the
-    /// system volume, never raise it.
-    private func migrateStoredVolumeToSystemVolume() {
-        guard let stored = defaults.object(forKey: kVolume) as? Float else { return }
-        if stored < 0.999, let system = SystemVolume.get() {
-            SystemVolume.set(system * stored)
-        }
-        defaults.removeObject(forKey: kVolume)
-    }
+    /// Volume the menu displays: this app's own software gain.
+    private var currentVolume: Float { player.volume }
 
     @objc private func openInBrowser(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
