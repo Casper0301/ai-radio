@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     branches: [main]
-    paths: [Info.plist]
+    paths: [Info.plist, .github/workflows/release.yml]
   workflow_dispatch:
 
 permissions:
